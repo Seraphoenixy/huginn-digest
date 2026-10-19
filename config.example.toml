@@ -1,0 +1,62 @@
+# 网页和后台统一读取本文件；填写凭据后勿提交或分享。所有日期按北京时间处理。
+[server]
+host = "127.0.0.1"
+port = 8000
+# 请求体按编码后的字节计；字段按解码后的字符计。超限请求不会进入业务处理。
+[web_limits]
+request_body_bytes = 65536
+password_chars = 1024
+target_chars = 4096
+source_name_chars = 200
+source_kind_chars = 16
+csrf_token_chars = 128
+source_order_chars = 16384
+day_chars = 10
+
+[site]
+name = "鸦闻 · 每日简报"
+public_url = "https://daily.example.com"
+nav_url = "https://nav.example.com"
+[pipeline]
+poll_seconds = 3600
+lookback_hours = 24
+per_source_limit = 20
+correction = true
+[asr]
+api_key = ""
+model = "XingChenAGI/XingChenASR-V3.2"
+# 其他：XingChenAGI/XingChenASR-V3.2-Ultra、XingChenAGI/XingChenGSR-V1.0、FunAudioLLM/SenseVoiceSmall
+segment_seconds = 600
+timeout = 300
+[llm]
+api_key = ""
+base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+model = "deepseek-v4.1-flash"
+timeout = 120
+thinking_disabled = true
+chunk_chars = 12000
+[worker]
+idle_seconds = 5
+max_attempts = 3
+
+# 运行 huginn-digest setup-admin 自动填写哈希和会话密钥（源码：python -m interaction.secrets_cli）。
+[security]
+password_hash = ""
+session_secret = ""
+# 本机HTTP设false；部署HTTPS改true。
+secure_cookie = false
+
+[bili]
+# 可选，B站Cookie文件；相对路径以config.toml所在目录为基准。
+cookie_file = ""
+# 需先通过 huginn-digest setup-bili（源码：python -m interaction.bili_credentials_cli） 导入配套刷新口令。
+auto_refresh = true
+refresh_check_seconds = 86400
+refresh_retry_seconds = 3600
+
+[storage]
+data_dir = "data"
+# 仅控制可再生产物，不删除原稿、纠错稿、当前摘要和日报。
+cache_days = 1
+intermediate_days = 7
+cache_max_mb = 512

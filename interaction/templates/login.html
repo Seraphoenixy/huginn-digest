@@ -1,0 +1,8 @@
+{% extends 'base.html' %}{% block content %}
+<div class="auth"><div class="auth__card">
+<span class="eyebrow">ADMINISTRATION</span><h1>管理日报</h1>
+<form method="post" action="/admin/login"><input type="hidden" name="token" value="{{ csrf }}">
+<div class="field"><label for="password">管理密码</label><input id="password" type="password" name="password" maxlength="{{ web_limits.password_chars }}" required autocomplete="current-password" placeholder="请输入管理密码"></div>
+<button class="btn" type="submit">登录管理页 →</button></form>
+</div></div>
+{% endblock %}

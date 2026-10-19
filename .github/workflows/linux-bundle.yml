@@ -1,0 +1,65 @@
+name: Linux executable
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install -r requirements-build.txt -r requirements-test.txt
+      - name: Offline regression with empty local configuration
+        run: |
+          cp config.example.toml config.toml
+          python -m unittest discover -s tests -v
+      - name: Build Linux directory bundle
+        run: python scripts/build_linux.py
+      - name: Verify packaged program
+        run: python scripts/smoke_bundle.py dist/huginn-digest-linux-x86_64/app/huginn-digest --media
+      - name: Verify archive on clean Linux without Python
+        run: |
+          docker run --rm -v "$PWD/dist:/input:ro" ubuntu:22.04 bash -euc '
+            apt-get update >/dev/null
+            apt-get install -y --no-install-recommends ffmpeg ca-certificates curl >/dev/null
+            if command -v python3 >/dev/null; then echo "Unexpected system Python"; exit 1; fi
+            mkdir /release
+            tar -xzf /input/huginn-digest-linux-x86_64.tar.gz -C /release
+            cd /release/huginn-digest-linux-x86_64
+            cp config.example.toml config.toml
+            app/huginn-digest doctor --media
+            app/huginn-digest worker --once
+            app/huginn-digest >/tmp/web.log 2>&1 &
+            web_pid=$!
+            trap "kill $web_pid 2>/dev/null || true" EXIT
+            for attempt in $(seq 1 60); do
+              if curl -fsS http://127.0.0.1:8000/health >/dev/null; then break; fi
+              sleep 1
+            done
+            curl -fsS http://127.0.0.1:8000/ >/dev/null
+            curl -fsS http://127.0.0.1:8000/static/source-order.js >/dev/null
+          '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huginn-digest-linux-x86_64
+          path: |
+            dist/huginn-digest-linux-x86_64.tar.gz
+            dist/huginn-digest-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error

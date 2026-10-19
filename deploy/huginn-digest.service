@@ -1,0 +1,21 @@
+[Unit]
+Description=Huginn Digest web and background processing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/huginn-digest
+ExecStart=/opt/huginn-digest/app/huginn-digest --config /opt/huginn-digest/config.toml serve
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+MemoryMax=2G
+TimeoutStopSec=300
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

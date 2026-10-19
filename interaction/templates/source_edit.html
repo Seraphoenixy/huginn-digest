@@ -1,0 +1,15 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page">
+<div class="page-head"><span class="eyebrow">SOURCE SETTINGS / 订阅设置</span><h1>编辑订阅来源</h1></div>
+<form class="form-card" method="post" action="/admin/sources/{{ source.id }}/edit">
+<input type="hidden" name="token" value="{{ csrf }}">
+<div class="form-grid">
+<div class="field"><label for="source-name">显示名称</label><input id="source-name" name="name" maxlength="{{ web_limits.source_name_chars }}" value="{{ source.name }}"></div>
+<div class="field"><label for="source-kind">来源类型</label><select id="source-kind" name="kind"><option value="bili" {% if source.kind=='bili' %}selected{% endif %}>B站UP主</option><option value="rss" {% if source.kind=='rss' %}selected{% endif %}>RSS订阅</option></select></div>
+<div class="field span-2"><label for="source-target">UP主MID、空间链接或RSS地址</label><input id="source-target" name="target" maxlength="{{ web_limits.target_chars }}" value="{{ source.target }}" required></div>
+</div>
+<p class="hint">仅改名称会保留检查进度。修改类型或目标后，从最近24小时重新检查；已有任务和日报保留，启停状态不变。</p>
+<div class="form-actions"><a class="btn btn--subtle" href="/admin">取消并返回</a><button class="btn" type="submit">保存修改</button></div>
+</form>
+</div>
+{% endblock %}

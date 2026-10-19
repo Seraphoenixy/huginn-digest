@@ -1,0 +1,37 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head"><span class="eyebrow">WORKSPACE / 日报管理</span><h1>让信息按时抵达。</h1><p class="meta">运行状态来自最近一次配置读取与后台轮次。</p></div>
+
+<div class="kpi-grid">
+<div class="kpi {{ 'kpi--ok' if configured.asr else 'kpi--off' }}"><span class="kpi__label">ASR 语音转写</span><span class="kpi__value"><span class="kpi__dot"></span>{{ '已配置' if configured.asr else '未配置' }}</span></div>
+<div class="kpi {{ 'kpi--ok' if configured.llm else 'kpi--off' }}"><span class="kpi__label">摘要模型</span><span class="kpi__value"><span class="kpi__dot"></span>{{ '已配置' if configured.llm else '未配置' }}</span></div>
+<div class="kpi {{ 'kpi--ok' if worker_heartbeat else 'kpi--off' }}"><span class="kpi__label">Worker 心跳</span><span class="kpi__value"><span class="kpi__dot"></span>{% if worker_heartbeat %}{{ worker_heartbeat|beijing_time }}{% else %}尚未启动{% endif %}</span></div>
+</div>
+
+<div class="grid-2">
+<div class="card"><h2 class="card__title">添加订阅</h2><p class="meta">首次检查最近24小时，每个来源每轮最多新增20条。</p><form class="form-row" method="post" action="/admin/sources"><input type="hidden" name="token" value="{{ csrf }}"><select name="kind"><option value="bili">B站UP主</option><option value="rss">RSS订阅</option></select><input name="target" maxlength="{{ web_limits.target_chars }}" placeholder="MID、空间链接或RSS地址" required><input name="name" maxlength="{{ web_limits.source_name_chars }}" placeholder="显示名称"><button class="btn">添加来源</button></form></div>
+<div class="card"><h2 class="card__title">处理指定视频</h2><p class="meta">只处理该 BV 号及其分P，不扫描该 UP 主的其他投稿。</p><form class="form-row" method="post" action="/admin/video"><input type="hidden" name="token" value="{{ csrf }}"><input name="target" maxlength="{{ web_limits.target_chars }}" placeholder="BV号或B站视频链接" required><button class="btn">提交视频</button></form></div>
+</div>
+
+<div class="section-head"><h2>订阅来源</h2><span class="meta">共 {{ sources|length }} 个 · 拖动 ⋮⋮ 排序</span></div>
+<div class="table-wrap"><table>
+<thead><tr><th>名称</th><th>目标</th><th>状态</th><th>操作</th></tr></thead>
+<tbody id="source-list" data-token="{{ csrf }}">{% for s in sources %}<tr data-source-id="{{ s.id }}"><td><div class="source-identity"><button type="button" class="btn btn--subtle btn--sm source-grip" draggable="true" aria-label="排序 {{ s.name }}，可用上下方向键" style="cursor:grab">⋮⋮</button> <span class="source-name">{{ s.name }}</span><span class="pill pill--muted source-kind">{{ "B站" if s.kind == "bili" else "RSS" }}</span></div></td><td><code>{{ s.target }}</code></td><td>{% if s.enabled %}<span class="pill pill--ok">启用</span>{% else %}<span class="pill pill--muted">暂停</span>{% endif %}{% if s.error %}<br><small>{{ s.error }}</small>{% endif %}</td><td><div class="row-actions"><a class="btn btn--subtle btn--sm" href="/admin/sources/{{ s.id }}/edit">编辑</a>{% for action,label in [('refresh','检查更新'),('toggle','启停'),('delete','删除')] %}<form class="inline" method="post" action="/admin/sources/{{ s.id }}/{{ action }}"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--sm {{ 'btn--danger' if action=='delete' else 'btn--subtle' }}">{{ label }}</button></form>{% endfor %}</div></td></tr>{% else %}<tr><td colspan="4">还没有订阅来源。</td></tr>{% endfor %}</tbody>
+</table></div>
+
+<p id="source-order-status" class="meta" role="status" aria-live="polite"></p>
+<script src="/static/source-order.js" defer></script>
+<div class="section-head"><h2>最近任务</h2><span class="meta">共 {{ tasks|length }} 条</span></div>
+<div class="table-wrap"><table>
+<thead><tr><th>日期 / 内容</th><th>状态</th><th>阶段 / 提示</th><th>操作</th></tr></thead>
+<tbody>{% for task in tasks %}<tr><td>{{ task.day }}<br><strong>{{ task.title }}</strong></td><td>{{ task.status|status_label }}<br><small>尝试 {{ task.attempts }}</small></td><td>{{ task.stage|stage_label }}{% if task.error %}<br><small>{{ task.error }}</small>{% endif %}{% if task.warning %}<br><small>{{ task.warning }}</small>{% endif %}</td><td>{% if task.status=='failed' %}<form method="post" action="/admin/tasks/{{ task.id }}/retry"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--sm">重试</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="4">等待新内容。</td></tr>{% endfor %}</tbody>
+</table></div>
+
+<div class="section-head"><h2>重新汇集日报</h2></div>
+<div class="card"><p class="meta">后台先检查该日期来源与已有产物，缺失内容重新采集或调用模型，已有结果复用；完成后刷新查看状态。</p><form class="form-row" method="post" action="/admin/rebuild"><input type="hidden" name="token" value="{{ csrf }}"><input type="date" name="day" required><button class="btn">提交重建任务</button></form>
+<div class="table-wrap table-wrap--nested"><table>
+<thead><tr><th>日期</th><th>重建状态</th><th>提示</th></tr></thead>
+<tbody>{% for job in rebuilds %}<tr><td>{{ job.day }}</td><td>{{ job.status|status_label }}</td><td>{{ job.error or '' }}</td></tr>{% else %}<tr><td colspan="3">暂无重建任务。后台未启动时，已提交任务会保持等待处理。</td></tr>{% endfor %}</tbody>
+</table></div></div>
+
+<div class="form-actions"><form method="post" action="/admin/logout"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--subtle">退出登录</button></form></div>
+{% endblock %}

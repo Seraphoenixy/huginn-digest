@@ -1,0 +1,24 @@
+{% extends 'base.html' %}{% block content %}
+<div class="layout">
+<nav class="nav-list" aria-label="往期归档">
+<p class="nav-list__title">往期归档</p>
+{% for day in dates %}<a class="nav-item" href="/daily/{{ day }}"{% if report and report.day == day %} aria-current="page"{% endif %}>{{ day }}</a>{% else %}<span class="nav-item">暂无归档</span>{% endfor %}
+</nav>
+<div class="layout__main">
+<section class="hero"><span class="eyebrow">DAILY BRIEFING / 信息有序，阅读从容</span><h1>{% if report %}{{ report.day }}<br>值得关注的事{% else %}你的每日资讯，<br>正在这里汇集。{% endif %}</h1>
+{% if report %}<p class="meta"><span class="pill{{ '' if report.final else ' pill--muted' }}">{{ '已定稿' if report.final else '持续更新' }}</span>{% if report.supplement %} · 定稿后补充更新{% endif %} · 最近更新 {{ report.updated|beijing_time }} · 点击标题展开要点</p>{% else %}<p class="meta">从指定来源获取信息，保留来源，让重要内容更容易抵达。</p>{% endif %}</section>
+{% if report %}{% for topic,entries in report.entries|groupby('topic') %}
+<div class="section-head"><h2>{{ topic }}</h2><span class="meta">{{ entries|length }} 条</span></div>
+{% for entry in entries %}<details class="entry"><summary class="entry__head"><div class="entry__heading"><h3>{{ entry.title }}</h3><p class="entry__source">来源：{{ entry.source_name }}</p></div><span class="entry__count">{{ entry.bullets|length }} 条要点</span><span class="chev" aria-hidden="true"></span></summary><div class="entry__body"><ul>{% for bullet in entry.bullets %}<li>{{ bullet }}</li>{% endfor %}</ul><a class="source" href="{{ entry.url }}" target="_blank" rel="noopener noreferrer">查看原文 ↗</a></div></details>{% endfor %}
+{% endfor %}{% else %}
+<div class="empty"><span class="empty__icon" aria-hidden="true">≡</span><h2>尚未发布第一份日报</h2><p>添加订阅后，完成处理的内容会自动出现在这里。</p></div>
+{% endif %}
+</div>
+<aside class="layout__info"><div class="card info-card"><h2 class="card__title">本日速览</h2>
+<dl class="info-list">
+<div><dt>收录条数</dt><dd>{% if report %}{{ report.entries|length }} 条{% else %}—{% endif %}</dd></div>
+<div><dt>涉及主题</dt><dd>{% if report %}{{ report.entries|groupby('topic')|list|length }} 个{% else %}—{% endif %}</dd></div>
+<div><dt>归档天数</dt><dd>{{ dates|length }} 天</dd></div>
+</dl></div></aside>
+</div>
+{% endblock %}
