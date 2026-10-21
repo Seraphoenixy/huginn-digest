@@ -61,7 +61,7 @@ def fetch(url):
     try:
         for _ in range(5):
             public_url(url)
-            with session.get(url, timeout=(10,30), allow_redirects=False, stream=True, headers={'User-Agent':'AutoDaily/1.0'}) as response:
+            with session.get(url, timeout=(10,30), allow_redirects=False, stream=True, headers={'User-Agent':'huginn-digest/1.0'}) as response:
                 if response.status_code in (301,302,303,307,308):
                     url = urljoin(url,response.headers['Location'])
                     continue

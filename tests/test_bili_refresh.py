@@ -14,7 +14,7 @@ from requests.adapters import BaseAdapter
 
 from config import Settings, ROOT
 from integration.bili_cookies import BiliSession
-from integration.bili_refresh import BASE, BiliRefreshError, cookie_value, correspond_path
+from integration.bili_refresh import BiliRefreshError, cookie_value, correspond_path
 from integration.lock import worker_lock
 from integration.sources.bili import BiliVideoSource, BiliSourceError, sanitize_cookie
 from orchestration.service import DailyService

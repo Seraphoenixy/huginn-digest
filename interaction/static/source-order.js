@@ -6,6 +6,8 @@ if (list) {
   let saved = Array.from(list.querySelectorAll('[data-source-id]'));
   const persist = async () => {
     saving = true;
+    list.dataset.sortVersion = String(Number(list.dataset.sortVersion || 0) + 1);
+    list.dataset.sorting = "true";
     message.textContent = '正在保存顺序…';
     try {
       const body = new URLSearchParams({token: list.dataset.token,
@@ -17,18 +19,21 @@ if (list) {
     } catch (_) {
       saved.forEach(row => list.appendChild(row));
       message.textContent = '保存失败，已恢复顺序；请刷新后重试。';
-    } finally { saving = false; }
+    } finally { saving = false; delete list.dataset.sorting; }
   };
-  list.querySelectorAll('.source-grip').forEach(handle => {
+  const bindHandles = () => list.querySelectorAll('.source-grip').forEach(handle => {
     handle.addEventListener('dragstart', event => {
       if (saving) { event.preventDefault(); return; }
       dragged = handle.closest('tr');
+      list.dataset.sorting = 'true';
+      list.dataset.sortVersion = String(Number(list.dataset.sortVersion || 0) + 1);
       event.dataTransfer.setData('text/plain', dragged.dataset.sourceId);
       event.dataTransfer.effectAllowed = 'move';
     });
     handle.addEventListener('dragend', () => {
       if (dragged) saved.forEach(row => list.appendChild(row));
       dragged = null;
+      if (!saving) delete list.dataset.sorting;
     });
     handle.addEventListener('keydown', event => {
       if (saving || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
@@ -40,6 +45,11 @@ if (list) {
       else list.insertBefore(other, row);
       handle.focus(); persist();
     });
+  });
+  bindHandles();
+  list.addEventListener('dashboard:updated', () => {
+    saved = Array.from(list.querySelectorAll('[data-source-id]'));
+    bindHandles();
   });
   list.addEventListener('dragover', event => {
     if (!dragged || saving) return;

@@ -3,7 +3,6 @@ import json
 import hashlib
 import shutil
 import time
-from pathlib import Path
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from config import ROOT
@@ -13,17 +12,26 @@ from integration.sources.rss import extract
 from model.asr import CloudASR
 from model.text import TextModel
 from integration.runtime_log import log
+from orchestration.terminology import apply_terms,check_terms,term_pattern
 
 STAGE_LABELS={'acquire':'获取正文/转写','correct':'校对转写','summarize':'生成摘要','finish':'保存结果'}
 
-def split_text(text,size):
+def split_text(text,size,protected=()):
     """优先沿段落/句末分片，保留全部字符；超长单句才按容量截取。"""
     if size<=0:raise ValueError('分片容量必须为正数')
     import re
+    protected_pattern=term_pattern(protected) if protected else None
+    longest=max(map(len,protected),default=0)
+    if longest>size:raise ValueError('受保护术语超过分片容量')
     chunks=[]
     while len(text)>size:
         candidates=[m.end() for m in re.finditer(r'\n|[。！？!?；;]',text[:size]) if m.end()>=size//2]
         end=candidates[-1] if candidates else size
+        if protected_pattern:
+            for match in protected_pattern.finditer(text[:size+longest]):
+                if match.start()<end<match.end():
+                    end=match.start()
+                    break
         chunks.append(text[:end]);text=text[end:]
     if text:chunks.append(text)
     return chunks
@@ -110,34 +118,151 @@ class ContentPipeline:
         self.store.update(task['id'],raw_path=str(path))
         return {'raw_path':str(path)}
 
+    def confirmed_terms(self,task):
+        video=extract_bvid_from_url(task['url'])
+        return [term for term in self.settings.correction_terms if term['video']==video]
+
+    def correction_fingerprint(self,text,title,terms=()):
+        context=self.settings.get('correction','context_chars',600)
+        material={'input':text,'title':title[:context],'prompt':self.prompt('correct'),
+                  'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),
+                  'chunk_chars':self.settings.get('correction','chunk_chars',4000),'context_chars':context,
+                  'min_length_ratio':self.settings.correction_min_length_ratio,'terms':terms,'version':4}
+        return hashlib.sha256(json.dumps(material,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+    def validate_correction(self,original,result):
+        import re
+        if not isinstance(result,str) or not result.strip() or result.strip().startswith('```'):
+            raise ValueError('纠错结果格式无效')
+        compact=lambda value:re.sub(r'\s+|【待核】','',value)
+        if len(compact(result))<len(compact(original))*self.settings.correction_min_length_ratio:
+            raise ValueError('纠错结果疑似遗漏正文')
+        if self.correction_numbers(original)!=self.correction_numbers(result):raise ValueError('纠错结果改变了数字')
+        return result
+
+    @staticmethod
+    def correction_numbers(text):
+        """只归一明确的数字书写差异；型号中的连字符不视为负号。"""
+        import re
+        import unicodedata
+        text=unicodedata.normalize('NFKC',text).replace('【待核】','').replace('−','-')
+        digits={'零':0,'〇':0,'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9}
+        def chinese(match):
+            token=match.group()
+            if '十' in token:
+                left,right=token.split('十')
+                return str((digits[left] if left else 1)*10+(digits[right] if right else 0))
+            return str(digits[token])
+        # 不把“一致”等普通词里的汉字当成数值，也不猜测复杂中文数字。
+        text=re.sub(r'(?<![零〇一二两三四五六七八九十百千万亿])(?:[一二两三四五六七八九]?十[一二三四五六七八九]?|[零〇一二两三四五六七八九])(?=[万亿千百年月日天个次倍半%])',chinese,text)
+        number=r'\d+(?:[.,]\d+)*(?:%|[万亿千百]|[KMBT](?![A-Z]))?'
+        return re.findall(r'(?<![A-Z0-9])[+-]?'+number+'|'+number,text.upper())
+
+    def validate_confirmed(self,original,result,terms):
+        if not isinstance(result,str):raise ValueError('纠错结果格式无效')
+        result=apply_terms(result,terms)
+        result=self.validate_correction(original,result)
+        check_terms(original,result,terms)
+        return result
+
+    def correction_part(self,path,original,terms=()):
+        try:return self.validate_confirmed(original,read_text(path),terms)
+        except (OSError,ValueError,UnicodeError):return None
+
+    def correction_current(self,raw_path,task):
+        folder=self.folder({'task_id':task['id']})
+        try:
+            manifest=json.loads(read_text(folder/'correction_manifest.json'))
+            text=read_text(raw_path)
+            terms=self.confirmed_terms(task)
+            result=read_text(folder/'corrected.txt')
+            return (manifest.get('complete') is True
+                    and manifest.get('fingerprint')==self.correction_fingerprint(text,task['title'],terms)
+                    and manifest.get('output_sha256')==hashlib.sha256(result.encode()).hexdigest()
+                    and bool(self.validate_confirmed(apply_terms(text,terms),result,terms)))
+        except (OSError,ValueError,KeyError,TypeError,AttributeError,UnicodeError):return False
+
+    def correction_warning(self,task_id,message):
+        previous=self.store.task(task_id)['warning']
+        if previous.startswith(('纠错失败','纠错部分失败','专名复核失败','纠错稿含')):previous=''
+        self.store.update(task_id,warning='；'.join(value for value in (previous,message) if value))
+
     def correct(self,state):
         task=self.store.task(state['task_id'])
-        path=self.folder(state)/'corrected.txt'
-        if path.exists():
-            log(f'任务 {task["id"]}：复用已有纠错稿')
-            return {'corrected_path':str(path)}
-        if task['kind']!='bili' or not self.settings.get('pipeline','correction',True):
+        folder=self.folder(state)
+        path=folder/'corrected.txt'
+        if task['kind']!='bili' or not self.settings.pipeline_correction:
             log(f'任务 {task["id"]}：无需校对，使用原始正文')
+            self.store.update(task['id'],corrected_path=state['raw_path'])
             return {'corrected_path':state['raw_path']}
         try:
             text=read_text(state['raw_path'])
-            size=self.settings.get('llm','chunk_chars',12000)
+            original=text
+            terms=self.confirmed_terms(task)
+            if not text.strip():raise ValueError('转写为空')
+            if self.correction_current(state['raw_path'],task):
+                log(f'任务 {task["id"]}：复用校验一致的纠错稿')
+                self.store.update(task['id'],corrected_path=str(path))
+                return {'corrected_path':str(path)}
+            fingerprint=self.correction_fingerprint(text,task['title'],terms)
+            text=apply_terms(text,terms)
+            manifest=folder/'correction_manifest.json'
+            try:reuse=json.loads(read_text(manifest)).get('fingerprint')==fingerprint
+            except (OSError,ValueError,AttributeError):reuse=False
+            if not reuse:
+                cached=[item for item in [path,manifest,*folder.glob('correction_*.txt')] if item.exists()]
+                if cached:
+                    archive=folder/f'previous_correction_{time.time_ns()}'
+                    archive.mkdir()
+                    for item in cached:item.replace(archive/item.name)
+                write_text(manifest,json.dumps({'fingerprint':fingerprint,'complete':False}))
+            chunks=split_text(text,self.settings.get('correction','chunk_chars',4000),[term['name'] for term in terms])
+            context=self.settings.get('correction','context_chars',600)
             parts=[]
-            chunks=split_text(text,size)
+            offset=0
+            failed_chunks=0
             for index,chunk in enumerate(chunks):
-                part=self.folder(state)/f'correction_{index}.txt'
-                if not part.exists():
-                    log(f'任务 {task["id"]}：请求云端纠错，第 {index+1}/{len(chunks)} 段')
-                    result=self.llm.call(self.prompt('correct'),chunk)
-                    if not result.strip():raise ValueError('纠错为空')
-                    write_text(part,result)
-                parts.append(read_text(part))
-            write_text(path,'\n'.join(parts))
-            self.store.update(task['id'],corrected_path=str(path))
-            return {'corrected_path':str(path)}
+                data={'video_title':task['title'][:context],
+                      'context_before':text[max(0,offset-context):offset],
+                      'text':chunk,'context_after':text[offset+len(chunk):offset+len(chunk)+context],
+                      'confirmed_terms':[term['name'] for term in terms if term['name'] in chunk]}
+                part_path=folder/f'correction_{index}.txt'
+                result=self.correction_part(part_path,chunk,terms)
+                if result is None:
+                    try:
+                        log(f'任务 {task["id"]}：请求云端纠错，第 {index+1}/{len(chunks)} 段')
+                        result=self.validate_confirmed(chunk,self.llm.call(self.prompt('correct'),json.dumps(data,ensure_ascii=False)),terms)
+                        write_text(part_path,result)
+                    except Exception:
+                        failed_chunks+=1
+                        separator='' if not index or (text[offset-1].isalnum() and chunk[0].isalnum()) else '\n'
+                        parts.append(separator+chunk)
+                        offset+=len(chunk)
+                        log(f'任务 {task["id"]}：本段纠错未通过，仅保留本段输入')
+                        continue
+                separator='' if not index or (text[offset-1].isalnum() and chunk[0].isalnum()) else '\n'
+                parts.append(separator+result)
+                offset+=len(chunk)
+            result=self.validate_confirmed(text,''.join(parts),terms)
+            write_text(path,result)
+            write_text(manifest,json.dumps({'fingerprint':fingerprint,'complete':failed_chunks==0,
+                                          'output_sha256':hashlib.sha256(result.encode()).hexdigest()}))
+            uncertain=result.count('【待核】')
+            warning=''
+            if failed_chunks:
+                fallback='转写及已确认术语' if text!=original else '原始转写'
+                failure=f'纠错失败，使用{fallback}生成摘要' if failed_chunks==len(chunks) else f'纠错部分失败，{failed_chunks} 段使用{fallback}'
+                warning='；'.join(value for value in (failure,warning) if value)
+            if uncertain:
+                warning=('；'.join(value for value in (warning,f'纠错稿含 {uncertain} 处待核词，请对照音频确认') if value))
+            self.correction_warning(task['id'],warning)
+            selected=state['raw_path'] if failed_chunks==len(chunks) and text==original else str(path)
+            self.store.update(task['id'],corrected_path=selected)
+            return {'corrected_path':selected}
         except Exception:
             log(f'任务 {task["id"]}：纠错失败，降级使用原始转写继续摘要')
-            self.store.update(task['id'],warning='纠错失败，使用原始转写生成摘要')
+            self.correction_warning(task['id'],'纠错失败，使用原始转写生成摘要')
+            self.store.update(task['id'],corrected_path=state['raw_path'])
             return {'corrected_path':state['raw_path']}
 
     def summarize(self,state):
@@ -212,7 +337,7 @@ class ContentPipeline:
         """复核产物，移除空/损坏的派生缓存，使真实节点按缺失步骤补齐。"""
         folder=self.folder({'task_id':task['id']})
         for path in folder.iterdir():
-            if not path.is_file() or path.name=='feed.txt':continue
+            if not path.is_file() or path.name in {'feed.txt','correction_manifest.json'}:continue
             if path.name not in {'raw.txt','corrected.txt','summary.json'} and not path.name.startswith(('part_','correction_','summary_part_')):continue
             try:
                 text=read_text(path)
@@ -220,7 +345,8 @@ class ContentPipeline:
                 if path.suffix=='.json':self.parse_summary(text)
             except (OSError,ValueError,UnicodeError):path.unlink(missing_ok=True)
         required=['raw.txt','summary.json']
-        if task['kind']=='bili' and self.settings.get('pipeline','correction',True):required.append('corrected.txt')
+        if task['kind']=='bili' and self.settings.pipeline_correction:required.append('corrected.txt')
         if any(not (folder/name).is_file() for name in required):return True
+        if 'corrected.txt' in required and not self.correction_current(folder/'raw.txt',task):return True
         input_path=folder/('corrected.txt' if 'corrected.txt' in required else 'raw.txt')
         return not self.summary_current(input_path,folder/'summary_manifest.json')

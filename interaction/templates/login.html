@@ -5,4 +5,14 @@
 <div class="field"><label for="password">管理密码</label><input id="password" type="password" name="password" maxlength="{{ web_limits.password_chars }}" required autocomplete="current-password" placeholder="请输入管理密码"></div>
 <button class="btn" type="submit">登录管理页 →</button></form>
 </div></div>
+{% if error %}
+{# 有脚本时只弹一个dialog；无脚本时用noscript兜底，两者不会同时出现，避免读屏重复播报。 #}
+<dialog id="login-error-dialog" class="feedback-dialog" aria-labelledby="login-error-title" aria-describedby="login-error-message">
+<h2 id="login-error-title">登录未成功</h2>
+<p id="login-error-message" role="alert">{{ error }}</p>
+<form method="dialog"><button class="btn" autofocus>知道了</button></form>
+</dialog>
+<noscript><p class="login-error" role="alert">{{ error }}</p></noscript>
+{% endif %}
+<script src="/static/login.js" defer></script>
 {% endblock %}

@@ -54,7 +54,9 @@ def create_app(settings=None, *, run_background=True):
 
     def render(request,name,**values):
         authenticated=bool(service.session(request.cookies.get('daily_session')).get('admin'))
-        return templates.TemplateResponse(request=request,name=name,context={'site':settings.site_name,'nav_url':settings.get('site','nav_url'),'canonical_url':settings.get('site','public_url').rstrip('/')+request.url.path,'request':request,'authenticated':authenticated,'web_limits':limits,**values})
+        public_url=settings.site_public_url.rstrip('/')
+        canonical=(public_url+request.url.path) if public_url else ''
+        return templates.TemplateResponse(request=request,name=name,context={'site':settings.site_name,'nav_url':settings.site_nav_url,'canonical_url':canonical,'request':request,'authenticated':authenticated,'web_limits':limits,**values})
 
     def admin(request):
         session=service.session(request.cookies.get('daily_session'))
@@ -76,6 +78,12 @@ def create_app(settings=None, *, run_background=True):
 
     @app.get('/static/source-order.js')
     def source_order_script():return FileResponse(ROOT/'interaction'/'static'/'source-order.js',media_type='text/javascript')
+
+    @app.get('/static/admin-refresh.js')
+    def admin_refresh_script():return FileResponse(ROOT/'interaction'/'static'/'admin-refresh.js',media_type='text/javascript')
+
+    @app.get('/static/login.js')
+    def login_script():return FileResponse(ROOT/'interaction'/'static'/'login.js',media_type='text/javascript')
 
     @app.get('/')
     def home(request:Request):return render(request,'daily.html',report=service.report(),dates=service.dates())
@@ -108,17 +116,31 @@ def create_app(settings=None, *, run_background=True):
         response=render(request,'login.html',csrf=service.session(token)['csrf'],error='')
         return cookie(response,token)
 
+    def login_error(request,message,status):
+        if not service.sessions.ready or not settings.admin_hash:
+            response=render(request,'login.html',csrf='',error='管理入口尚未配置，请在服务器先设置管理密码。')
+            response.status_code=503
+            return response
+        existing=request.cookies.get('daily_session')
+        session=service.session(existing)
+        token=existing if session.get('csrf') else service.new_session()
+        response=render(request,'login.html',csrf=service.session(token)['csrf'],error=message)
+        response.status_code=status
+        return cookie(response,token)
+
     @app.post('/admin/login')
     def login(request:Request,password:str=Form(max_length=limits['password_chars']),token:str=Form(max_length=limits['csrf_token_chars'])):
-        csrf(request,token,False)
+        try:csrf(request,token,False)
+        except HTTPException:
+            return login_error(request,'登录表单已过期，请重新输入密码。',403)
         ip=request.client.host if request.client else 'unknown'
-        if not service.login(password,ip):raise HTTPException(401,'登录失败或尝试次数过多')
+        if not service.login(password,ip):return login_error(request,'登录失败或尝试次数过多，请检查密码或稍后重试。',401)
         return cookie(RedirectResponse('/admin',status_code=303),service.new_session(True))
 
     @app.get('/admin')
     def dashboard(request:Request):
         session=admin(request)
-        return render(request,'admin.html',csrf=session['csrf'],**service.dashboard())
+        return render(request,'admin.html',csrf=session['csrf'],admin_refresh_seconds=settings.admin_refresh_seconds,**service.dashboard())
 
     @app.post('/admin/logout')
     def logout(request:Request,token:str=Form(max_length=limits['csrf_token_chars'])):
@@ -181,7 +203,9 @@ def create_app(settings=None, *, run_background=True):
     @app.post('/admin/rebuild')
     def rebuild(request:Request,day:str=Form(max_length=limits['day_chars']),token:str=Form(max_length=limits['csrf_token_chars'])):
         csrf(request,token)
-        try:service.request_rebuild(day)
+        try:queued=service.request_rebuild(day)
         except Exception:raise HTTPException(400,'日期无效或重建请求提交失败，既有日报保留') from None
+        if not queued:
+            raise HTTPException(409,'该日期已有排队或进行中的重建任务，请等待完成')
         return RedirectResponse('/admin',status_code=303)
     return app

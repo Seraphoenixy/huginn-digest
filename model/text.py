@@ -1,7 +1,6 @@
 from integration.http.llm import complete
 
 class TextModel:
-    RESOURCE_KIND = 'remote'
     def __init__(self, settings):
         self.settings = settings
 

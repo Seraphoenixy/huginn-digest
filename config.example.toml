@@ -2,6 +2,8 @@
 [server]
 host = "127.0.0.1"
 port = 8000
+# 管理页状态刷新间隔（秒），不触发采集或模型调用。
+admin_refresh_seconds = 5
 # 请求体按编码后的字节计；字段按解码后的字符计。超限请求不会进入业务处理。
 [web_limits]
 request_body_bytes = 65536
@@ -15,6 +17,7 @@ day_chars = 10
 
 [site]
 name = "鸦闻 · 每日简报"
+# 留空则不输出canonical链接与导航入口；填写时必须是无内嵌凭据的HTTP(S)地址。
 public_url = "https://daily.example.com"
 nav_url = "https://nav.example.com"
 [pipeline]
@@ -22,6 +25,16 @@ poll_seconds = 3600
 lookback_hours = 24
 per_source_limit = 20
 correction = true
+# 仅视频转写纠错使用；每段调用一次模型。
+[correction]
+chunk_chars = 4000
+context_chars = 600
+# 可选：只应用人工确认且绑定单个视频的术语；不按发音猜测，不跨视频替换。
+# evidence 填确认依据，勿填写凭据。以下整行置于本段，替换为实际BV号及名称后取消注释。
+# terms = [{video = "BV1xx411c7mD", name = "ExampleTool", aliases = ["Example Tool"], evidence = "人工核对的官方名称"}]
+# 拒绝明显缩写成摘要的结果；同时保护数字，允许有限的等价书写变化。
+min_length_ratio = 0.75
+
 [asr]
 api_key = ""
 model = "XingChenAGI/XingChenASR-V3.2"
@@ -56,7 +69,7 @@ refresh_retry_seconds = 3600
 
 [storage]
 data_dir = "data"
-# 仅控制可再生产物，不删除原稿、纠错稿、当前摘要和日报。
+# 仅控制可再生产物，不删除原稿、纠错稿、当前摘要和活动日报版本。
 cache_days = 1
 intermediate_days = 7
 cache_max_mb = 512

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="canonical" href="{{ canonical_url }}">
+{% if canonical_url %}<link rel="canonical" href="{{ canonical_url }}">{% endif %}
 <meta name="theme-color" content="#f3f3f3" media="(prefers-color-scheme:light)">
 <meta name="theme-color" content="#1b1b1b" media="(prefers-color-scheme:dark)">
 <title>{{ site }}</title>
@@ -279,6 +279,13 @@ tbody td>form,.row-actions>form,.form-actions>form{display:flex;align-items:cent
 .auth__card::before{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--accent-line),transparent)}
 .auth__card h1{font-size:28px;margin:var(--s3) 0 var(--s5)}
 .auth__card .btn{width:100%;margin-top:var(--s4)}
+.login-error{margin-top:var(--s3);font-size:13px;color:var(--danger)}
+.feedback-dialog{width:min(420px,calc(100% - 32px));margin:auto;padding:var(--s5);color:var(--text);background:var(--surface);border:1px solid var(--stroke-strong);border-radius:var(--r-panel);box-shadow:var(--shadow-8)}
+.feedback-dialog::backdrop{background:rgba(0,0,0,.35)}
+.feedback-dialog h2{font-size:20px;margin-bottom:var(--s3)}
+.feedback-dialog p{font-size:14px;color:var(--text-2)}
+.feedback-dialog form{display:flex;justify-content:flex-end;margin-top:var(--s5)}
+
 
 .form-card{width:100%;padding:var(--s6);background:var(--surface);border:1px solid var(--stroke);border-radius:var(--r-panel);box-shadow:var(--shadow-4)}
 .page{width:min(100%,760px);margin:0 auto}
@@ -334,7 +341,7 @@ tbody td>form,.row-actions>form,.form-actions>form{display:flex;align-items:cent
   <div class="header-inner">
     <a class="brand" href="/">{{ site }}</a>
     <nav>
-      <a href="{{ nav_url }}">返回导航 ↗</a>
+      {% if nav_url %}<a href="{{ nav_url }}">返回导航 ↗</a>{% endif %}
       <a href="/">最新日报</a>
       {% if authenticated %}<a href="/admin">管理后台 · 已登录</a>{% else %}<a href="/admin/login">管理登录</a>{% endif %}
     </nav>

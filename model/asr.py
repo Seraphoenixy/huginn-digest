@@ -5,7 +5,6 @@ from integration.media import split_audio
 from integration.http.siliconflow_asr import transcribe_audio
 
 class CloudASR:
-    RESOURCE_KIND = 'remote'
     def __init__(self, settings):
         self.settings = settings
 

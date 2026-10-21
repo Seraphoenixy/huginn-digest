@@ -1,25 +1,41 @@
 """RSS读取与正文抽取，不做推理。"""
 import calendar
+import time
 from urllib.parse import urljoin
 import feedparser
 import trafilatura
 from integration.http.public import fetch, public_url
+from integration.runtime_log import log
 
-def discover(url, fallback_time):
+
+def discover(url, now=None):
+    """解析订阅条目；单条非法链接只跳过该条，不让整源检查失败。
+
+    缺少发布时间的条目按发现时刻归日，避免新条目被写进建立订阅当天的历史日报。
+    """
     feed = feedparser.parse(fetch(url))
     if feed.bozo and not feed.entries:
         raise ValueError('无法解析RSS')
+    discovered = now if now is not None else time.time()
     entries = []
+    skipped = 0
     for item in feed.entries:
-        link = urljoin(url,item.get('link',''))
+        link = urljoin(url, item.get('link', ''))
         if not item.get('link'):
             continue
-        public_url(link)
+        try:
+            public_url(link)
+        except ValueError:
+            skipped += 1
+            continue
         stamp = item.get('published_parsed') or item.get('updated_parsed')
-        published = calendar.timegm(stamp) if stamp else fallback_time
-        body = '\n'.join(c.get('value','') for c in item.get('content',[])) or item.get('summary','')
-        entries.append({'url':link,'title':item.get('title',link),'published':published,'body':body})
+        published = calendar.timegm(stamp) if stamp else discovered
+        body = '\n'.join(c.get('value', '') for c in item.get('content', [])) or item.get('summary', '')
+        entries.append({'url': link, 'title': item.get('title', link), 'published': published, 'body': body})
+    if skipped:
+        log(f'RSS：跳过 {skipped} 条不可访问的链接')
     return entries
+
 
 def extract(url, fallback=''):
     try:

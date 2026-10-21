@@ -12,8 +12,7 @@ from integration.lock import worker_lock
 from integration.bili_refresh import BiliRefreshError
 from config import BILI_AUTO_REFRESH, BILI_REFRESH_CHECK_SECONDS, BILI_REFRESH_RETRY_SECONDS
 
-META = '# qingniao-digest-login: '
-LEGACY_META = '# auto-daily-login: '
+META = '# huginn-digest-login: '
 
 
 def scoped(cookie):
@@ -41,7 +40,7 @@ class BiliSession(requests.Session):
                 return
         if header and header.startswith('#LWP-Cookies-2.0'):
             for line in header.splitlines():
-                if line.startswith((META, LEGACY_META)):
+                if line.startswith(META):
                     self._metadata = json.loads(line.split(': ', 1)[1])
                     if not isinstance(self._metadata, dict):
                         raise ValueError('无效登录凭据格式')
@@ -74,7 +73,8 @@ class BiliSession(requests.Session):
             with worker_lock(str(self.cookie_file) + '.lock'):
                 self._save()
         except (OSError, BiliRefreshError):
-            print('B站Cookie保存失败，请检查文件权限或稍后重试')
+            from integration.runtime_log import log
+            log('B站Cookie保存失败，请检查文件权限或稍后重试')
 
     def _save(self):
         temporary = None
@@ -145,7 +145,8 @@ class BiliSession(requests.Session):
                 if not meta.get('pending_confirm') and now - meta.get('last_check', 0) < check_seconds:
                     return
                 from integration.bili_refresh import check, rotate, confirm
-                old_cookies = copy(self.cookies)
+                # 必须深拷贝：copy.copy只复制字典外壳，rotate会原地修改共享的cookie字典。
+                old_cookies = self.cookies.copy()
                 old_meta = dict(meta)
                 committed = False
                 self._suspend_persist = True
@@ -174,16 +175,19 @@ class BiliSession(requests.Session):
                     meta.pop('error', None)
                     self._save()
                 except Exception as exc:
-                    if not committed:
-                        # 确认恢复分支已有持久的新凭据，不回退到过期凭据。
+                    code = getattr(exc, 'code', 'refresh')
+                    if not committed and meta.get('refresh_token') == old_meta.get('refresh_token'):
+                        # rotate未产生新口令，旧凭据仍有效，可以整体回滚。
                         self.cookies = old_cookies
                         self._metadata = dict(old_meta)
-                    self._metadata.update(last_attempt=now, error=getattr(exc, 'code', 'refresh'))
+                    # rotate已成功时服务端已废止旧口令，保留内存中的新凭据与待确认标记，
+                    # 下次冷却后先补保存再补确认，绝不写回“新Cookie+旧口令”的组合。
+                    self._metadata.update(last_attempt=now, error=code)
                     try:
                         self._save()
                     except Exception:
                         pass
-                    raise BiliRefreshError(getattr(exc, 'code', 'refresh')) from None
+                    raise BiliRefreshError(code) from None
                 finally:
                     self._suspend_persist = False
         except BiliRefreshError:

@@ -19,6 +19,10 @@ TZ=timezone(timedelta(hours=8))
 def day_of(stamp):
     return datetime.fromtimestamp(stamp,TZ).date().isoformat()
 
+def normalize_day(day):
+    """接受用户输入的宽松日期，统一存成与任务相同的ISO格式。"""
+    return datetime.strptime(str(day).strip(),'%Y-%m-%d').date().isoformat()
+
 def is_final(day,now=None):
     now=datetime.fromtimestamp(time.time() if now is None else now,TZ)
     cutoff=datetime.fromisoformat(day).replace(tzinfo=TZ)+timedelta(days=1,hours=8)
@@ -33,6 +37,7 @@ class DailyService:
         self._login_lock=Lock()
         self._waiting=False
         self._cleanup_at=0
+        self._publish_signature={}
 
     def session(self,token):
         value=self.sessions.read(token)
@@ -210,7 +215,7 @@ class DailyService:
     def poll(self,day=None):
         now=time.time()
         result={'errors':[],'capped':False}
-        start=datetime.strptime(day,'%Y-%m-%d').replace(tzinfo=TZ).timestamp() if day else None
+        start=datetime.strptime(normalize_day(day),'%Y-%m-%d').replace(tzinfo=TZ).timestamp() if day else None
         interval=self.settings.get('pipeline','poll_seconds',3600)
         for source in self.store.sources():
             if not source['enabled'] or (day is None and now-source['last_poll']<interval):continue
@@ -218,7 +223,7 @@ class DailyService:
             log(f'来源 {source["id"]}（{source["kind"]}）：开始检查新增内容')
             try:
                 cutoff=start if day else source['created']-self.settings.get('pipeline','lookback_hours',24)*3600
-                if source['kind']=='rss':items=discover(source['target'],source['created'])
+                if source['kind']=='rss':items=discover(source['target'],now)
                 else:
                     client=self.bili();items=[]
                     try:
@@ -243,38 +248,86 @@ class DailyService:
                         if not self.store.query('SELECT id FROM tasks WHERE url=?',(item['url'],)):result['capped']=True
                         continue
                     if self.enqueue(source['kind'],item,source['id']):count+=1
-                self.store.execute('UPDATE sources SET last_poll=?,error=? WHERE id=?',(now,'',source['id']))
+                self.store.execute('UPDATE sources SET last_poll=?,error=? WHERE id=?',(now if day is None else source['last_poll'],'',source['id']))
                 log(f'来源 {source["id"]}：检查完成，获取 {len(items)} 条候选，新增入队 {count} 条，耗时 {time.perf_counter()-started:.1f} 秒')
             except Exception as exc:
                 error=str(exc) if isinstance(exc,BiliSourceError) else type(exc).__name__
                 result['errors'].append(source['id'])
-                self.store.execute('UPDATE sources SET last_poll=?,error=? WHERE id=?',(now,error,source['id']))
+                self.store.execute('UPDATE sources SET last_poll=?,error=? WHERE id=?',(now if day is None else source['last_poll'],error,source['id']))
                 log(f"来源 {source['id']} 检查失败：{error}；耗时 {time.perf_counter()-started:.1f} 秒，按来源检查间隔等待重试")
         return result
 
     def publish(self,day,force=False):
-        datetime.strptime(day,'%Y-%m-%d')
+        day=normalize_day(day)
+        # 只发布成功摘要；单条缺失或损坏不能阻断整轮，也不能把已发布条目挤掉。
         tasks=self.store.query("SELECT * FROM tasks WHERE day=? AND status='done' ORDER BY published,id",(day,))
         if not tasks:return None
         entries=[]
+        broken=[]
         for task in tasks:
-            result=json.loads(read_text(task['summary_path']))
-            entries.append({'id':task['id'],'title':task['title'],'url':task['url'],'published':task['published'],'topic':result['topic'],'bullets':result['bullets'],'source_name':self.source_label(task)})
+            try:
+                result=json.loads(read_text(task['summary_path']))
+                if not isinstance(result,dict) or not isinstance(result.get('bullets'),list):
+                    raise ValueError('摘要格式无效')
+            except (OSError,TypeError,ValueError):
+                broken.append(task['id'])
+                continue
+            entries.append({'id':task['id'],'title':task['title'],'url':task['url'],'published':task['published'],'topic':result.get('topic'),'bullets':result['bullets'],'source_name':self.source_label(task)})
+        if broken:
+            log(f'日报 {day}：{len(broken)} 条已完成任务的摘要缺失或损坏，沿用其此前条目，待重建补齐')
+        # 未成功（失败、重试中或摘要损坏）的任务继续展示上一次成功条目，日报不因处理失败而缩水。
+        last=self.store.latest(day)
+        previous=self._previous_entries(last)
+        entries=self._merge_previous(entries,previous,{task['id'] for task in self.store.query('SELECT id FROM tasks WHERE day=?',(day,))})
+        if len(entries)>len(tasks)-len(broken):
+            log(f'日报 {day}：{len(entries)-(len(tasks)-len(broken))} 条未成功任务沿用上一次成功条目')
+        if not entries:
+            # 没有任何可用条目时不发布空日报，保留上一版（若有）。
+            log(f'日报 {day}：没有可用摘要，本次不发布')
+            return None
         fingerprint=hashlib.sha256(json.dumps(entries,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
         final=is_final(day)
-        last=self.store.latest(day)
-        if last and last['fingerprint']==fingerprint and bool(last['final'])==final:
+        if last and last['fingerprint']==fingerprint and bool(last['final'])==final and Path(last['path']).is_file():
             if force:log(f'日报 {day}：内容复核完成，与已发布版本一致')
             return last
+        # 已存在相同内容且文件完好的版本时只切换活动指针，不再写新文件，避免孤儿文件。
+        existing=self.store.version_by_fingerprint(day,fingerprint,final)
+        if existing and Path(existing['path']).is_file():
+            self.store.set_active(day,existing['id'])
+            log(f'日报 {day}：内容回到此前版本，切换活动版本，{len(entries)} 条内容')
+            return self.store.latest(day)
         snapshot={'day':day,'updated':time.time(),'final':final,'supplement':bool(last and last['final'] and last['fingerprint']!=fingerprint),'entries':entries}
         path=self.settings.data_dir/'reports'/day/f'{time.time_ns()}.json'
         write_text(path,json.dumps(snapshot,ensure_ascii=False))
-        self.store.execute('INSERT OR IGNORE INTO versions(day,path,fingerprint,final,created) VALUES(?,?,?,?,?)',(day,str(path),fingerprint,int(final),snapshot['updated']))
+        self.store.publish_version(day,path,fingerprint,final,snapshot['updated'])
         log(f'日报 {day}：发布完成，{len(entries)} 条内容，'+('定稿后补充' if snapshot['supplement'] else '已定稿' if final else '持续更新'))
         return self.store.latest(day)
 
+    @staticmethod
+    def _previous_entries(last):
+        """读取上一次活动版本，用于沿用未成功任务的历史条目。"""
+        if not last:return []
+        try:
+            payload=json.loads(read_text(last['path']))
+            entries=payload.get('entries',[])
+            return [entry for entry in entries if isinstance(entry,dict) and 'id' in entry]
+        except (OSError,ValueError,TypeError):
+            return []
+
+    @staticmethod
+    def _merge_previous(entries,previous,day_task_ids):
+        """未成功任务的旧条目按原顺序保留；已完成任务以最新摘要为准。"""
+        current={entry['id'] for entry in entries}
+        merged=list(entries)
+        for entry in previous:
+            if entry['id'] in current:continue
+            if entry['id'] not in day_task_ids:continue
+            merged.append(entry)
+        merged.sort(key=lambda entry:(entry.get('published',0),entry.get('id',0)))
+        return merged
+
     def request_rebuild(self,day):
-        datetime.strptime(day,'%Y-%m-%d')
+        day=normalize_day(day)
         return self.store.request_rebuild(day)
 
     def process_rebuild(self):
@@ -301,11 +354,12 @@ class DailyService:
                 self.pipeline.run(task)
                 self.store.set_meta('heartbeat',time.time())
             incomplete=self.store.query("SELECT id FROM tasks WHERE day=? AND status!='done'",(request['day'],))
-            # 允许成功内容更新，失败任务与来源检查不冒充完整成功。
+            # 允许成功内容更新，失败任务与来源检查不冒充完整成功；publish沿用未成功任务的既有条目。
             published=self.publish(request['day'],force=True)
             if inspection['errors'] or inspection['capped'] or incomplete:
                 message=f'来源失败 {len(inspection["errors"])} 个，未完成任务 {len(incomplete)} 个'
                 if inspection['capped']:message+='；达到单轮采集上限，请再次重建补齐'
+                if published is not None:message+='；已发布内容保留，未成功条目沿用上一次成功版本'
                 self.store.execute("UPDATE rebuilds SET status='failed',error=?,updated=? WHERE id=?",(message,time.time(),request['id']))
                 log(f'日报 {request["day"]}：重建未全部完成，{message}；已有日报保留')
                 return True
@@ -327,8 +381,12 @@ class DailyService:
             day=dates[0]
         row=self.store.latest(day)
         if not row:return None
-        result=json.loads(read_text(row['path']))
-        for entry in result['entries']:
+        try:
+            result=json.loads(read_text(row['path']))
+        except (OSError,ValueError,TypeError):
+            log(f'日报 {day}：活动版本文件不可读，公开页暂无可展示内容')
+            return None
+        for entry in result.get('entries',[]):
             if 'source_name' not in entry:
                 tasks=self.store.query('SELECT * FROM tasks WHERE id=?',(entry['id'],))
                 entry['source_name']=self.source_label(tasks[0]) if tasks else '历史来源'
@@ -375,12 +433,27 @@ class DailyService:
             queued=len(self.store.query("SELECT id FROM tasks WHERE status='queued'"))
             log(f'等待中：暂无可立即执行的任务，待重试 {queued} 个；将自动检查新任务和到期来源')
             self._waiting=True
-        # 扫描已成功条目的日期，补齐崩溃发生在完成与发布之间的情况。
-        for row in self.store.query("SELECT DISTINCT day FROM tasks WHERE status='done'"):
-            self.publish(row['day'])
+        self.publish_dirty()
         # tick仅由持锁Worker执行；此时没有运行中的下载或模型调用。
         if time.time()-self._cleanup_at>=3600:
             from integration.cleanup import cleanup
             result=cleanup(self.settings,self.store.query('SELECT id,status FROM tasks'))
+            self.store.prune_events(time.time()-30*86400)
             self._cleanup_at=time.time()
             if result['files']:log(f'空间清理：移除 {result["files"]} 个缓存文件，释放 {result["bytes"]/1048576:.1f} MB')
+
+    def publish_dirty(self,force=False):
+        """只重算完成状态变化的日期；逐日隔离异常，单日失败不阻断其他日期。"""
+        signature=self.store.done_signature()
+        for day in sorted(signature):
+            if not force and self._publish_signature.get(day)==signature[day]:continue
+            try:
+                self.publish(day,force=force)
+            except Exception as exc:
+                # 保留旧签名，下一轮继续重试该日期，其他日期不受影响。
+                log(f'日报 {day}：发布失败（{type(exc).__name__}），其他日期继续')
+                continue
+            self._publish_signature[day]=signature[day]
+        for day in list(self._publish_signature):
+            if day not in signature:
+                self._publish_signature.pop(day,None)

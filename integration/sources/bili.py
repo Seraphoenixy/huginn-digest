@@ -18,10 +18,10 @@ import time
 import hashlib
 import urllib.parse
 
-import requests
 from copy import copy
 from integration.bili_cookies import BiliSession
 from integration.bili_refresh import BiliRefreshError
+from integration.runtime_log import log
 from config import BILI_AUTO_REFRESH, BILI_REFRESH_CHECK_SECONDS, BILI_REFRESH_RETRY_SECONDS
 
 
@@ -96,19 +96,18 @@ def sanitize_cookie(cookie_value):
 
 def extract_mid_from_url(url_or_mid):
     """
-    从B站空间URL或纯数字中提取用户ID
+    从B站空间URL或纯数字中提取用户ID。
+
+    只接受纯数字或 space.bilibili.com 链接，避免把任意含数字的地址当成UP主。
     """
-    if url_or_mid.isdigit():
-        return url_or_mid
-    patterns = [
-        r'space\.bilibili\.com/(\d+)',
-        r'/(\d+)(?:/|$)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url_or_mid)
-        if match:
-            return match.group(1)
-    return None
+    value = str(url_or_mid).strip()
+    if value.isdigit():
+        return value
+    parts = urllib.parse.urlsplit(value if '//' in value else 'https://' + value)
+    if (parts.hostname or '').lower() not in {'space.bilibili.com', 'm.bilibili.com'}:
+        return None
+    match = re.search(r'/(\d+)(?:/|$)', parts.path)
+    return match.group(1) if match else None
 
 
 def extract_bvid_from_url(url_or_bvid):
@@ -160,17 +159,15 @@ class BiliVideoSource:
     def __init__(self, cookie=None, cookie_file=None,
                  download_cache_dir=None, keep_media=False, auto_refresh=BILI_AUTO_REFRESH,
                  refresh_check_seconds=BILI_REFRESH_CHECK_SECONDS, refresh_retry_seconds=BILI_REFRESH_RETRY_SECONDS):
-        # 默认走 config 工作缓存（cache/downloads）；None 时惰性导入避免集成层硬依赖
+        # 默认使用系统临时目录，避免集成层反查配置；编排层始终显式传入data/cache/downloads。
         if download_cache_dir is None:
-            import config
-            download_cache_dir = config.DOWNLOAD_CACHE_DIR
+            import tempfile
+            download_cache_dir = os.path.join(tempfile.gettempdir(), 'huginn-digest-downloads')
         self.download_cache_dir = download_cache_dir
         self.keep_media = keep_media
         self.auto_refresh = auto_refresh
         self.refresh_check_seconds = refresh_check_seconds
         self.refresh_retry_seconds = refresh_retry_seconds
-        # 最近一次 iter_user_videos 探测到的投稿总数（可能为 0，表示未知）
-        self.user_total = 0
 
         self.session = BiliSession(cookie_file)
         self.session.headers.update({
@@ -215,8 +212,8 @@ class BiliVideoSource:
                 self.session.cookies.set('buvid3', data['b_3'], domain='.bilibili.com')
             if data.get('b_4'):
                 self.session.cookies.set('buvid4', data['b_4'], domain='.bilibili.com')
-        except Exception as e:
-            print("获取设备 Cookie 失败（不影响已登录请求）")
+        except Exception:
+            log('B站设备Cookie获取失败（不影响已登录请求）')
 
     def _get_wbi_mixin_key(self):
         """
@@ -318,60 +315,6 @@ class BiliVideoSource:
         except Exception:
             raise BiliSourceError(None, self._login_status) from None
 
-    def iter_user_videos(self, mid, ps=30):
-        """
-        逐页生成用户全部投稿视频（生成器）。
-        每拉到一页就逐个 yield，消费方可边收边处理，中途中断不丢进度。
-        探测到投稿总数后写入 self.user_total。
-        """
-        seen_aids = set()
-        pn = 1
-        empty_rounds = 0
-        max_pn = 100
-        self.user_total = 0
-
-        while pn <= max_pn:
-            vlist, cur_total = self.fetch_page(mid, pn, ps)
-
-            if cur_total and cur_total > 0 and pn == 1:
-                self.user_total = cur_total
-                print(f"探测到用户投稿总数: {cur_total} 个")
-
-            if not vlist:
-                empty_rounds += 1
-                if empty_rounds >= 2:
-                    print(f"连续 {empty_rounds} 页无数据，停止翻页")
-                    return
-                pn += 1
-                time.sleep(1.5)
-                continue
-            empty_rounds = 0
-
-            for v in vlist:
-                aid = v.get('aid') or v.get('bvid')
-                if aid and aid in seen_aids:
-                    continue
-                seen_aids.add(aid)
-                yield v
-
-            if cur_total > 0 and len(seen_aids) >= cur_total:
-                print(f"已达到总数 {cur_total}，停止翻页")
-                return
-            if len(vlist) < ps:
-                print(f"本页数量({len(vlist)}) < 页大小({ps})，说明已到末尾")
-                return
-
-            pn += 1
-            time.sleep(1.0)
-
-    def get_user_videos(self, mid, ps=30):
-        """
-        一次性拉取用户全部投稿列表（iter_user_videos 的收集版）。
-        """
-        videos = list(self.iter_user_videos(mid, ps))
-        print(f"视频列表抓取结束，共 {len(videos)} 个")
-        return videos
-
     def get_video_info(self, url_or_id):
         """
         获取单个视频详情，支持 BV 号、视频 URL、av 号和 aid。
@@ -382,7 +325,7 @@ class BiliVideoSource:
         bvid = extract_bvid_from_url(url_or_id)
         aid = None if bvid else extract_aid_from_url(url_or_id)
         if not bvid and not aid:
-            print("无法识别视频地址或BV/av号")
+            log('B站：无法识别视频地址或BV/av号')
             return None
 
         url = "https://api.bilibili.com/x/web-interface/view"
@@ -391,11 +334,11 @@ class BiliVideoSource:
             resp = self.session.get(url, params=params, timeout=15)
             data = resp.json()
             if data.get('code') != 0:
-                print("获取视频详情失败，请检查视频或登录状态")
+                log('B站：获取视频详情失败，请检查视频或登录状态')
                 return None
             return data.get('data') or None
-        except Exception as e:
-            print("获取视频详情出错，请检查网络或登录状态")
+        except Exception:
+            log('B站：获取视频详情出错，请检查网络或登录状态')
             return None
 
     def get_video_pages(self, bvid):
@@ -480,7 +423,7 @@ class BiliVideoSource:
                 from integration.media import system_media_environment
                 with system_media_environment():
                     ydl.download([url])
-        except Exception as e:
+        except Exception:
             raise RuntimeError("视频下载失败，请检查网络或登录状态") from None
 
         media_path = self._find_downloaded_file(page_dir, f"P{page_num}")
@@ -488,25 +431,22 @@ class BiliVideoSource:
             raise RuntimeError("下载完成但未找到产物文件")
         return media_path
 
-    def clear_cached_media(self, bvid):
-        """
-        删除某视频的下载缓存目录（断点续传语义下由编排层按需调用）。
-        """
-        page_dir = os.path.join(self.download_cache_dir, bvid)
-        if os.path.isdir(page_dir):
-            import shutil
-            shutil.rmtree(page_dir, ignore_errors=True)
-
     @staticmethod
     def _find_downloaded_file(page_dir, prefix):
         """
-        在 page_dir 中查找以 prefix 开头的已下载文件（跳过分片目录）。
+        在 page_dir 中查找以 prefix 开头的完整下载产物。
+
+        yt-dlp的未完成文件以 .part/.ytdl 结尾，绝不能当作成品交给ASR，
+        否则中断的下载会产出截断转写且不再重试。
         """
         if not os.path.isdir(page_dir):
             return None
         candidates = []
-        for name in os.listdir(page_dir):
+        for name in sorted(os.listdir(page_dir)):
             path = os.path.join(page_dir, name)
-            if os.path.isfile(path) and name.startswith(prefix + '.'):
-                candidates.append(path)
+            if not os.path.isfile(path) or not name.startswith(prefix + '.'):
+                continue
+            if name.endswith(('.part', '.ytdl', '.temp', '.tmp')):
+                continue
+            candidates.append(path)
         return candidates[0] if candidates else None

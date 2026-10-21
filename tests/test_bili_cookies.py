@@ -10,19 +10,20 @@ from integration.sources.bili import BiliVideoSource, BiliSourceError
 
 
 class CookieTests(unittest.TestCase):
-    def test_legacy_login_metadata_survives_project_rename(self):
-        from integration.bili_cookies import BiliSession, META, LEGACY_META
+    def test_unknown_login_metadata_is_ignored(self):
+        from integration.bili_cookies import BiliSession, META
         from integration.sources.bili import sanitize_cookie
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'cookie.txt'
             with BiliSession(path) as session:
                 session.import_login('SESSDATA=fixture; bili_jct=fixture', 'fixture-token', sanitize_cookie)
-            path.write_text(path.read_text(encoding='utf-8').replace(META, LEGACY_META), encoding='utf-8')
+            # 非本程序写入的元数据行不得被当作刷新口令读取。
+            path.write_text(path.read_text(encoding='utf-8').replace(META, '# other-tool-login: '),
+                            encoding='utf-8')
             source = BiliVideoSource(cookie_file=str(path), download_cache_dir=directory)
-            self.assertEqual(source.session._metadata['refresh_token'], 'fixture-token')
+            self.assertEqual(source.session._metadata, {})
             source.session.persist()
-            self.assertIn(META, path.read_text(encoding='utf-8'))
-            self.assertNotIn(LEGACY_META, path.read_text(encoding='utf-8'))
+            self.assertNotIn('# other-tool-login: ', path.read_text(encoding='utf-8'))
             source.session.close()
     def test_real_requests_extracts_set_cookie_before_saving(self):
         from email.message import Message

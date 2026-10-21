@@ -11,7 +11,9 @@ def check_runtime(settings, media=False):
     from integration.bili_refresh import correspond_path
     from integration.media import split_audio
     for resource in ('interaction/templates/daily.html', 'interaction/templates/base.html',
-                     'interaction/static/source-order.js', 'knowledge/prompts/correct.md',
+                     'interaction/templates/login.html', 'interaction/templates/admin.html',
+                     'interaction/static/source-order.js', 'interaction/static/admin-refresh.js',
+                     'interaction/static/login.js', 'knowledge/prompts/correct.md',
                      'knowledge/prompts/summarize.md'):
         if not (ROOT / resource).read_text(encoding='utf-8').strip():
             raise ValueError('程序资源缺失')
@@ -22,7 +24,9 @@ def check_runtime(settings, media=False):
     if not trafilatura.extract('<html><body><article><p>' + 'Offline article content. ' * 100 + '</p></article></body></html>'):
         raise ValueError('正文提取不可用')
     correspond_path(1700000000000)
-    results = ['模板、脚本与提示词：可用', '下载器、正文提取与加密：可用', '任务存储：可用']
+    results = ['模板、脚本与提示词：可用',
+               f'下载器、正文提取与加密：可用（yt-dlp {yt_dlp.version.__version__}）',
+               '任务存储：可用']
     if media:
         with tempfile.TemporaryDirectory(dir=settings.cache_dir) as directory:
             path = Path(directory) / 'sample.wav'

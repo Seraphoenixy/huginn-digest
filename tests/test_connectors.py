@@ -1,11 +1,9 @@
-import json
 import socket
 import unittest
 from unittest.mock import patch, Mock
 from integration.http.public import public_url, fetch
 from integration.http.llm import complete, CloudError
 from integration.sources import rss
-from model.asr import CloudASR
 
 class ConnectorTests(unittest.TestCase):
     def test_reject_private_and_invalid_addresses(self):
@@ -26,7 +24,7 @@ class ConnectorTests(unittest.TestCase):
     def test_rss_discovery_and_article_fallback(self):
         feed=b'''<rss version="2.0"><channel><title>News</title><item><title>Story</title><link>https://example.com/story</link><pubDate>Sun, 18 Oct 2026 01:00:00 GMT</pubDate><description>Facts from original feed</description></item></channel></rss>'''
         with patch.object(rss,'fetch',return_value=feed),patch.object(rss,'public_url',side_effect=lambda u:u):
-            rows=rss.discover('https://example.com/rss',0)
+            rows=rss.discover('https://example.com/rss')
         self.assertEqual(len(rows),1)
         self.assertEqual(rows[0]['title'],'Story')
         self.assertGreater(rows[0]['published'],0)
