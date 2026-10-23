@@ -407,10 +407,15 @@ class LockFileTests(unittest.TestCase):
         from integration.lock import worker_lock
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'x.lock'
+            sizes = []
             for _ in range(5):
                 with worker_lock(str(path)):
                     pass
-            self.assertEqual(path.stat().st_size, 1)
+                sizes.append(path.stat().st_size)
+            # Windows 的 msvcrt.locking 需要 1 字节锁区；POSIX 的 flock 锁整个文件，
+            # 不必写入内容，文件可为空。两种平台都只要求大小稳定，不随加锁次数增长。
+            self.assertEqual(sizes, [sizes[0]] * 5)
+            self.assertLessEqual(sizes[0], 1)
 
 
 if __name__ == '__main__':
