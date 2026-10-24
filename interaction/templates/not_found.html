@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block content %}
+<div class="empty"><span class="empty__icon" aria-hidden="true">404</span><h2>这一期不在架上</h2>
+<p>{{ day }} 没有已发布的日报，可能已被撤回，或链接有误。</p>
+<div class="form-row empty__actions">{% if latest %}<a class="btn" href="/">回到最新一期（{{ latest }}）</a>{% else %}<a class="btn" href="/">回到首页</a>{% endif %}</div></div>
+{% endblock %}

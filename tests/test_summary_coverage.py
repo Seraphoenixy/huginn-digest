@@ -42,7 +42,7 @@ class SummaryCoverageTests(unittest.TestCase):
             old=json.dumps({'topic':'行业','bullets':['旧摘要']})
             write_text(folder/'summary.json',old)
             write_text(folder/'summary_part_0.json',old)
-            pipeline.llm.call=Mock(return_value=json.dumps({'topic':'行业','bullets':['首条新闻','末条新闻']}))
+            pipeline.llm.call=Mock(return_value=json.dumps({'topic':'行业','title':'合并后标题','bullets':['首条新闻','末条新闻']}))
             pipeline.summarize(state)
             pipeline.llm.call.assert_called_once()
             archive=list(folder.glob('previous_summary_*'))

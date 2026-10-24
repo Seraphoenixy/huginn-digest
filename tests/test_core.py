@@ -74,7 +74,7 @@ class CoreTests(unittest.TestCase):
         self.service.enqueue('rss',self.item())
         task=self.service.store.claim()
         pipeline=ContentPipeline(self.settings,self.service.store)
-        pipeline.llm.call=Mock(return_value=json.dumps({'topic':'技术','bullets':['测试']}))
+        pipeline.llm.call=Mock(return_value=json.dumps({'topic':'技术','title':'测试标题','bullets':['测试']}))
         with patch('orchestration.pipeline.extract',return_value=('原始正文','')):
             pipeline.run(task)
         self.assertEqual(self.service.store.task(task['id'])['status'],'done')
@@ -133,7 +133,8 @@ class CoreTests(unittest.TestCase):
         with patch('orchestration.pipeline.extract',side_effect=RuntimeError('private')):pipeline.run(task)
         self.assertEqual(self.service.store.task(task['id'])['status'],'failed')
         self.service.retry(task['id'])
-        self.assertEqual(self.service.store.task(task['id'])['attempts'],0)
+        # 手动重试不再清零累计次数，否则每次点击都会重新获得完整的自动重试额度。
+        self.assertEqual(self.service.store.task(task['id'])['attempts'],3)
         self.assertEqual(self.service.store.claim()['id'],task['id'])
 
     def test_html_is_escaped_on_public_page(self):

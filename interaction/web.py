@@ -1,6 +1,7 @@
 """Web仅调用编排门面，公开阅读与管理会话分离。"""
 import asyncio
 import hmac
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Form, HTTPException
@@ -10,6 +11,9 @@ from interaction.request_limits import RequestBodyLimitMiddleware
 from fastapi.templating import Jinja2Templates
 from config import Settings, ROOT
 from orchestration.service import DailyService
+from orchestration.status import duration_text, explain_error, rebuild_label, stage_label, status_label
+
+TASK_VIEWS={'all','active','failed','done','canceled','retracted'}
 
 def create_app(settings=None, *, run_background=True):
     settings=settings or Settings()
@@ -38,8 +42,13 @@ def create_app(settings=None, *, run_background=True):
                             headers={'Cache-Control':'no-store'})
     templates=Jinja2Templates(directory=str(ROOT/'interaction'/'templates'))
     templates.env.filters['beijing_time']=lambda stamp:datetime.fromtimestamp(float(stamp),timezone(timedelta(hours=8))).strftime('%m-%d %H:%M')
-    templates.env.filters['status_label']=lambda status:{'queued':'等待处理','running':'正在处理','done':'已完成','failed':'等待重试'}.get(status,status)
-    templates.env.filters['stage_label']=lambda stage:{'acquire':'获取正文','correct':'校对转写','summarize':'生成摘要','finish':'处理完成'}.get(stage,stage)
+    templates.env.filters['beijing_datetime']=lambda stamp:datetime.fromtimestamp(float(stamp),timezone(timedelta(hours=8))).strftime('%m-%d %H:%M:%S')
+    templates.env.filters['status_label']=status_label
+    templates.env.filters['stage_label']=stage_label
+    templates.env.filters['rebuild_label']=rebuild_label
+    templates.env.filters['duration']=duration_text
+    templates.env.filters['error_text']=explain_error
+    templates.env.filters['ago']=lambda stamp:duration_text(time.time()-float(stamp))+'前' if stamp else '—'
 
     @app.middleware('http')
     async def headers(request,call_next):
@@ -56,7 +65,24 @@ def create_app(settings=None, *, run_background=True):
         authenticated=bool(service.session(request.cookies.get('daily_session')).get('admin'))
         public_url=settings.site_public_url.rstrip('/')
         canonical=(public_url+request.url.path) if public_url else ''
-        return templates.TemplateResponse(request=request,name=name,context={'site':settings.site_name,'nav_url':settings.site_nav_url,'canonical_url':canonical,'request':request,'authenticated':authenticated,'web_limits':limits,**values})
+        return templates.TemplateResponse(request=request,name=name,context={'site':settings.site_name,'nav_url':settings.site_nav_url,'canonical_url':canonical,'page_title':settings.site_name,'description':'','og_type':'website','request':request,'authenticated':authenticated,'web_limits':limits,**values})
+
+    def describe(report):
+        """分享用的摘要：只取标题，不含正文与任何凭据。"""
+        if not report:return f'{settings.site_name}：来自公开来源的每日资讯摘要。'
+        entries=report.get('entries',[])
+        titles=[str(entry.get('title') or '').strip() for entry in entries][:3]
+        titles=[title for title in titles if title]
+        text=f'{report["day"]} 收录 {len(entries)} 条：'+' · '.join(titles)
+        return text[:120]
+
+    def missing_day(request,day,latest):
+        """不存在的日期渲染页面而不是 JSON：用户多从收藏或旧链接进来。"""
+        response=render(request,'not_found.html',day=day,latest=latest,
+                        page_title=f'没有 {day} 的日报 · {settings.site_name}',
+                        description=f'{day} 没有已发布的日报，可以查看最新一期。')
+        response.status_code=404
+        return response
 
     def admin(request):
         session=service.session(request.cookies.get('daily_session'))
@@ -86,13 +112,24 @@ def create_app(settings=None, *, run_background=True):
     def login_script():return FileResponse(ROOT/'interaction'/'static'/'login.js',media_type='text/javascript')
 
     @app.get('/')
-    def home(request:Request):return render(request,'daily.html',report=service.report(),dates=service.dates())
+    def home(request:Request):
+        model=service.briefing()
+        report=model['report']
+        return render(request,'daily.html',**model,
+                      page_title=f'{report["day"]} · {settings.site_name}' if report else settings.site_name,
+                      description=describe(report))
 
     @app.get('/daily/{day}')
     def daily(request:Request,day:str):
-        report=service.report(day)
-        if not report:raise HTTPException(404,'没有该日期的已发布日报')
-        return render(request,'daily.html',report=report,dates=service.dates())
+        day=day.strip()
+        if len(day)!=10 or not day[4]=='-' or not day[7]=='-':
+            return missing_day(request,day[:10],service.briefing()['latest'])
+        model=service.briefing(day)
+        if not model['report']:
+            return missing_day(request,day,model['latest'])
+        return render(request,'daily.html',**model,
+                      page_title=f'{model["report"]["day"]} · {settings.site_name}',
+                      description=describe(model['report']),og_type='article')
 
     @app.get('/api/public/preview')
     def preview():return service.preview()
@@ -138,9 +175,39 @@ def create_app(settings=None, *, run_background=True):
         return cookie(RedirectResponse('/admin',status_code=303),service.new_session(True))
 
     @app.get('/admin')
-    def dashboard(request:Request):
+    def dashboard(request:Request,view:str='all',day:str=''):
         session=admin(request)
-        return render(request,'admin.html',csrf=session['csrf'],admin_refresh_seconds=settings.admin_refresh_seconds,**service.dashboard())
+        view=view if view in TASK_VIEWS else 'all'
+        day=day.strip()
+        if day:
+            try:day=datetime.strptime(day,'%Y-%m-%d').date().isoformat()
+            except ValueError:raise HTTPException(400,'日期格式应为 YYYY-MM-DD') from None
+        return render(request,'admin.html',csrf=session['csrf'],admin_refresh_seconds=settings.admin_refresh_seconds,
+                      **service.dashboard(view,day or None))
+
+    @app.get('/admin/status')
+    def admin_status(request:Request):
+        """管理页高频轮询的实时状态摘要：只读元数据，不触发采集或模型调用。"""
+        admin(request)
+        return JSONResponse(service.activity_status(),headers={'Cache-Control':'no-store'})
+
+    @app.post('/admin/config/reload')
+    def reload_config(request:Request,token:str=Form(max_length=limits['csrf_token_chars'])):
+        csrf(request,token)
+        changed,state,deferred=service.reload_model_config()
+        if not changed and state['error']:
+            raise HTTPException(409,f'配置未生效：{state["error"]}；仍使用上一版')
+        # 处理中只登记待应用，不做半途切换；页面通过 llm.pending 显示。
+        return RedirectResponse('/admin',status_code=303)
+
+    @app.post('/admin/cleanup')
+    def cleanup_now(request:Request,token:str=Form(max_length=limits['csrf_token_chars'])):
+        """手动执行一次空间清理；与定时任务共用同一实现。"""
+        csrf(request,token)
+        result=service.run_cleanup()
+        if result is None:
+            raise HTTPException(409,'清理未完成，请查看服务日志；已有内容未受影响')
+        return RedirectResponse('/admin',status_code=303)
 
     @app.post('/admin/logout')
     def logout(request:Request,token:str=Form(max_length=limits['csrf_token_chars'])):
@@ -197,8 +264,41 @@ def create_app(settings=None, *, run_background=True):
 
     @app.post('/admin/tasks/{task_id}/retry')
     def retry(request:Request,task_id:int,token:str=Form(max_length=limits['csrf_token_chars'])):
-        csrf(request,token);service.retry(task_id)
+        csrf(request,token)
+        try:service.retry(task_id)
+        except ValueError as exc:raise HTTPException(409,str(exc)) from None
         return RedirectResponse('/admin',status_code=303)
+
+    @app.post('/admin/tasks/{task_id}/retract')
+    def retract(request:Request,task_id:int,reason:str=Form('',max_length=limits['source_name_chars']),token:str=Form(max_length=limits['csrf_token_chars'])):
+        """撤回/恢复已发布条目：与其他写操作共用管理员会话与CSRF校验。"""
+        csrf(request,token)
+        try:service.retract_entry(task_id,reason)
+        except ValueError as exc:raise HTTPException(409,str(exc)) from None
+        return RedirectResponse('/admin?view=done',status_code=303)
+
+    @app.post('/admin/tasks/{task_id}/restore')
+    def restore(request:Request,task_id:int,token:str=Form(max_length=limits['csrf_token_chars'])):
+        csrf(request,token)
+        try:service.restore_entry(task_id)
+        except ValueError as exc:raise HTTPException(409,str(exc)) from None
+        return RedirectResponse('/admin?view=retracted',status_code=303)
+
+    @app.post('/admin/rebuild/range')
+    def rebuild_range(request:Request,days:str=Form(max_length=4),token:str=Form(max_length=limits['csrf_token_chars'])):
+        """重建最近 N 天；按日展开入队，复用既有每日重建流程。"""
+        csrf(request,token)
+        try:
+            numeric=int(days)
+        except (TypeError,ValueError):
+            raise HTTPException(400,'重建天数无效') from None
+        try:
+            queued=service.request_rebuild_range(numeric)
+        except ValueError as exc:
+            raise HTTPException(400,str(exc)) from None
+        if not queued:
+            raise HTTPException(409,'该区间没有可重建的内容，或这些日期已在队列中')
+        return RedirectResponse('/admin?view=rebuilds',status_code=303)
 
     @app.post('/admin/rebuild')
     def rebuild(request:Request,day:str=Form(max_length=limits['day_chars']),token:str=Form(max_length=limits['csrf_token_chars'])):

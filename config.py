@@ -1,5 +1,11 @@
-"""配置唯一出口：显式参数 > 非空环境变量 > config.toml。"""
+"""配置唯一出口：显式参数 > 非空环境变量 > config.toml。
+
+[llm] 文本模型段支持运行中热重载；其余设置仍在启动时读取，修改后需重启。
+热重载只替换模型配置，不重建应用、不改变 Web 监听、会话密钥或数据目录。
+"""
 import os
+import threading
+import time
 import tomllib
 import sys
 from dataclasses import dataclass, field
@@ -11,6 +17,36 @@ APP_ROOT = Path(sys.executable).resolve().parent.parent if getattr(sys, 'frozen'
 BILI_AUTO_REFRESH = True
 BILI_REFRESH_CHECK_SECONDS = 86400
 BILI_REFRESH_RETRY_SECONDS = 3600
+
+
+def parse_llm_config(values):
+    """校验并提取 [llm] 段；热重载与启动读取共用同一规则。"""
+    section=values.get('llm',{})
+    if not isinstance(section,dict):
+        raise ValueError('配置 [llm] 必须是表')
+    base_url=section.get('base_url','')
+    if not isinstance(base_url,str) or not base_url.strip():
+        raise ValueError('配置 llm.base_url 必须是非空HTTPS地址')
+    parts=urlsplit(base_url)
+    if parts.scheme!='https' or not parts.hostname or parts.username or parts.password:
+        raise ValueError('配置 llm.base_url 必须是使用无内嵌凭据的HTTPS地址')
+    model=section.get('model','')
+    if not isinstance(model,str) or not model.strip():
+        raise ValueError('配置 llm.model 必须是非空字符串')
+    timeout=section.get('timeout',120)
+    if not isinstance(timeout,int) or isinstance(timeout,bool) or not 1<=timeout<=1800:
+        raise ValueError('配置 llm.timeout 超出支持范围')
+    chunk_chars=section.get('chunk_chars',12000)
+    if not isinstance(chunk_chars,int) or isinstance(chunk_chars,bool) or not 1000<=chunk_chars<=12000:
+        raise ValueError('配置 llm.chunk_chars 超出支持范围')
+    thinking_disabled=section.get('thinking_disabled',True)
+    if not isinstance(thinking_disabled,bool):
+        raise ValueError('配置 llm.thinking_disabled 必须是布尔值')
+    api_key=section.get('api_key','')
+    if not isinstance(api_key,str):
+        raise ValueError('配置 llm.api_key 必须是字符串')
+    return {'base_url':base_url,'model':model,'timeout':timeout,'chunk_chars':chunk_chars,
+            'thinking_disabled':thinking_disabled,'api_key':api_key}
 
 @dataclass
 class Settings:
@@ -28,6 +64,7 @@ class Settings:
         self.config_file=Path(self.config_file).resolve()
         with open(self.config_file, 'rb') as stream:
             self.values = tomllib.load(stream)
+        llm_key_explicit=self.llm_key is not None
         self.site_name=self.get('site','name','鸦闻 · 每日简报')
         if not isinstance(self.site_name,str) or not self.site_name.strip():raise ValueError('配置 site.name 必须是非空字符串')
         # 站点地址可为空：为空时页面不输出 canonical/导航链接，而不是整站500。
@@ -83,29 +120,24 @@ class Settings:
                 raise ValueError(f'配置 web_limits.{key} 超出支持范围')
             self.web_limits[key]=value
         # 每项都带默认值：旧配置缺段或缺键时沿用默认，不会因升级直接拒绝启动。
+        # [llm] 的 timeout/chunk_chars 由 parse_llm_config 统一校验，不在此重复。
         for section,key,default,minimum,maximum in [
             ('pipeline','poll_seconds',3600,60,86400),
             ('pipeline','per_source_limit',20,1,20),
             ('pipeline','lookback_hours',24,1,24),
             ('asr','segment_seconds',600,1,600),
             ('asr','timeout',300,1,1800),
-            ('llm','chunk_chars',12000,1000,12000),
-            ('llm','timeout',120,1,1800),
             ('worker','idle_seconds',5,1,60),
             ('worker','max_attempts',3,1,5),
+            ('worker','max_total_attempts',10,2,100),
         ]:
             value=self.get(section,key,default)
             if not isinstance(value,int) or isinstance(value,bool) or not minimum<=value<=maximum:
                 raise ValueError(f'配置 {section}.{key} 超出支持范围')
-        self.llm_base_url=self.get('llm','base_url','')
-        if not isinstance(self.llm_base_url,str) or not self.llm_base_url.strip():
-            raise ValueError('配置 llm.base_url 必须是非空HTTPS地址')
-        parts=urlsplit(self.llm_base_url)
-        if parts.scheme!='https' or not parts.hostname or parts.username or parts.password:
-            raise ValueError('配置 llm.base_url 必须是使用无内嵌凭据的HTTPS地址')
-        for section,key in [('asr','model'),('llm','model')]:
-            value=self.get(section,key,'')
-            if not isinstance(value,str) or not value.strip():raise ValueError(f'配置 {section}.{key} 必须是非空字符串')
+        llm=parse_llm_config(self.values)
+        self.llm_base_url=llm['base_url']
+        value=self.get('asr','model','')
+        if not isinstance(value,str) or not value.strip():raise ValueError('配置 asr.model 必须是非空字符串')
         for key,default,minimum,maximum in [('chunk_chars',4000,1000,8000),('context_chars',600,0,2000)]:
             value=self.get('correction',key,default)
             if type(value) is not int or not minimum<=value<=maximum:raise ValueError(f'配置 correction.{key} 超出支持范围')
@@ -142,10 +174,78 @@ class Settings:
             value=self.get('storage',key,default)
             if not isinstance(value,int) or isinstance(value,bool) or not 1<=value<=maximum:
                 raise ValueError(f'配置 storage.{key} 超出支持范围')
+        # transcript_days允许0：表示永久保留转写原文（升级前的行为）。
+        transcript_days=self.get('storage','transcript_days',30)
+        if not isinstance(transcript_days,int) or isinstance(transcript_days,bool) or not 0<=transcript_days<=3650:
+            raise ValueError('配置 storage.transcript_days 超出支持范围')
+        # report_days允许0：表示日报永久保留（升级前的行为）。
+        self.report_retention_days=self.get('storage','report_days',1095)
+        if not isinstance(self.report_retention_days,int) or isinstance(self.report_retention_days,bool) \
+                or not 0<=self.report_retention_days<=36500:
+            raise ValueError('配置 storage.report_days 超出支持范围')
         self.content_dir = self.data_dir / 'content'
         self.cache_dir = self.data_dir / 'cache'
         for p in (self.data_dir, self.content_dir, self.cache_dir):
             p.mkdir(parents=True, exist_ok=True)
+        # 热重载元数据；不在repr或日志中保存任何凭据。
+        self._llm_key_explicit=llm_key_explicit
+        self._llm_lock=threading.RLock()
+        self._llm_stamp=self._config_stamp()
+        self.llm_revision=1
+        self.llm_reloaded_at=time.time()
+        self.llm_reload_error=''
 
     def get(self, section, key, default=None):
         return self.values.get(section, {}).get(key, default)
+
+    def _config_stamp(self):
+        """用文件元数据判断是否变化；先stat，只有变化时才重新解析。"""
+        try:
+            stat=os.stat(self.config_file)
+            return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            return None
+
+    def refresh_llm(self, force=False):
+        """原子替换[llm]配置；失败保留旧配置并记录不含内容的错误。
+
+        只应用文本模型段，不改变监听地址、会话密钥、数据目录或来源等启动期设置。
+        环境变量LLM_BRAIN_API_KEY仍优先于配置文件；显式构造的llm_key优先于两者。
+        """
+        stamp=self._config_stamp()
+        with self._llm_lock:
+            if not force and stamp==self._llm_stamp:
+                return False
+            self._llm_stamp=stamp
+            try:
+                with open(self.config_file, 'rb') as stream:
+                    values=tomllib.load(stream)
+                llm=parse_llm_config(values)
+                key=self.llm_key if self._llm_key_explicit else (os.getenv('LLM_BRAIN_API_KEY') or llm['api_key'])
+                if not isinstance(key,str):
+                    raise ValueError('配置 llm.api_key 必须是字符串')
+                self.values['llm']=values.get('llm',{})
+                self.llm_key=key
+                self.llm_base_url=llm['base_url']
+                self.llm_revision+=1
+                self.llm_reloaded_at=time.time()
+                self.llm_reload_error=''
+                return True
+            except (OSError,tomllib.TOMLDecodeError):
+                self.llm_reload_error='配置文件读取或解析失败'
+                return False
+            except ValueError as exc:
+                self.llm_reload_error=str(exc)
+                return False
+            except Exception:
+                self.llm_reload_error='配置热加载失败'
+                return False
+
+    def llm_state(self):
+        """管理页可见的模型状态；不返回Key或完整接口路径。"""
+        with self._llm_lock:
+            model=self.values.get('llm',{}).get('model','')
+            return {'model':model,'host':urlsplit(self.llm_base_url).hostname or '',
+                    'revision':self.llm_revision,'reloaded_at':self.llm_reloaded_at,
+                    'error':self.llm_reload_error,'configured':bool(self.llm_key),
+                    'pending':self._config_stamp()!=self._llm_stamp}

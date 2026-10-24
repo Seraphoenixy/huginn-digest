@@ -13,6 +13,8 @@ from integration.sources.rss import discover
 from integration.http.public import public_url
 from integration.auth import Sessions, verify_password
 from integration.runtime_log import log
+from orchestration.runtime import RuntimeState
+from orchestration.status import stage_label, task_state, rebuild_state, explain_error, TOPIC_ORDER, topic_name
 
 TZ=timezone(timedelta(hours=8))
 
@@ -38,6 +40,11 @@ class DailyService:
         self._waiting=False
         self._cleanup_at=0
         self._publish_signature={}
+        self.runtime=RuntimeState()
+        self._last_heartbeat=0.0
+        self._config_error_logged=''
+        # 处理中检测到的配置变更只登记，任务结束后由下一轮 tick 应用。
+        self._config_deferred=False
 
     def session(self,token):
         value=self.sessions.read(token)
@@ -78,8 +85,7 @@ class DailyService:
         if media:
             self.check_media_tools()
         from integration.runtime_check import check_runtime
-        from orchestration.pipeline import ContentPipeline
-        ContentPipeline(self.settings, self.store)
+        self._ensure_pipeline()
         return ['LangGraph：可用'] + check_runtime(self.settings, media=media)
 
     def check_media_tools(self, required=True):
@@ -94,6 +100,60 @@ class DailyService:
             return False
         log('FFmpeg/FFprobe检测通过')
         return True
+
+    def _touch_heartbeat(self, force=False):
+        """长任务内也保持心跳新鲜；写库按两秒节流，页面实时状态走内存。"""
+        now=time.time()
+        if force or now-self._last_heartbeat>=2:
+            self.store.set_meta('heartbeat',now)
+            self._last_heartbeat=now
+
+    def refresh_config(self, force=False):
+        """在任务之间应用[llm]变更；同一任务内不混用两个模型。"""
+        activity=self.runtime.snapshot()
+        if activity['kind'] in ('task','rebuild'):
+            # 正在处理时只标记待应用，避免摘要分片和缓存指纹跨模型。
+            if self.settings.llm_state()['pending'] or force:
+                self._config_deferred=True
+            return False
+        return self._apply_config(force=force)
+
+    def _pipeline_progress(self,task_id,stage,detail,current=None,total=None):
+        """由流水线回调：任务号在途时只更新当前任务的进度，避免串到其他任务。"""
+        activity=self.runtime.snapshot()
+        if task_id is not None and activity.get('task_id') not in (None,task_id):return
+        self.runtime.update(stage=stage,detail=detail,current=current,total=total)
+        self._touch_heartbeat()
+
+    def _ensure_pipeline(self):
+        if self.pipeline is None:
+            from orchestration.pipeline import ContentPipeline
+            self.pipeline=ContentPipeline(self.settings,self.store,progress=self._pipeline_progress)
+        return self.pipeline
+
+    def _run_task(self,task,parent=''):
+        """串行执行一个任务；活动状态只在持锁Worker线程内切换。
+
+        重建内的任务保留“重建日报”为主标签，任务号与标题作为细节，
+        这样刷新时不会在两种活动之间跳动。
+        """
+        if parent=='rebuild':
+            self.runtime.begin('rebuild',f'重建日报 {task["day"]}',day=task['day'],stage='process',
+                               detail='处理任务',parent='rebuild',
+                               task_id=task['id'],title=task['title'])
+        else:
+            self.runtime.begin('task',f'处理任务 #{task["id"]}',detail='准备开始',
+                               task_id=task['id'],title=task['title'],day=task['day'],parent=parent)
+        self._touch_heartbeat(force=True)
+        try:
+            self._ensure_pipeline().run(task)
+        finally:
+            if parent=='rebuild':
+                self.runtime.begin('rebuild',f'重建日报 {task["day"]}',day=task['day'],stage='process',
+                                   detail='任务结束，继续补齐',parent='rebuild')
+            else:
+                self.runtime.finish('空闲','等待下一轮调度')
+            self._touch_heartbeat(force=True)
 
     @contextmanager
     def background_worker(self):
@@ -126,30 +186,34 @@ class DailyService:
 
     def run_forever(self, once=False, stop_event=None, ready_event=None):
         from integration.lock import worker_lock
-        with worker_lock(self.settings.data_dir/'worker.lock'):
-            self.check_media_tools()
-            from orchestration.pipeline import ContentPipeline
-            self.pipeline=ContentPipeline(self.settings,self.store)
-            recovered=len(self.store.query("SELECT id FROM tasks WHERE status='running'"))
-            self.store.recover()
-            log(f'后台已启动；来源 {len(self.store.sources())} 个，恢复任务 {recovered} 个；来源检查间隔 {self.settings.get("pipeline","poll_seconds",3600)} 秒')
-            if ready_event is not None:
-                ready_event.set()
-            if once:
-                self.tick()
-                return
-            stop_event = stop_event or Event()
-            while not stop_event.is_set():
-                try:
+        self.runtime.start()
+        self._touch_heartbeat(force=True)
+        try:
+            with worker_lock(self.settings.data_dir/'worker.lock'):
+                self.check_media_tools()
+                self._ensure_pipeline()
+                recovered=len(self.store.query("SELECT id FROM tasks WHERE status='running'"))
+                self.store.recover()
+                log(f'后台已启动；来源 {len(self.store.sources())} 个，恢复任务 {recovered} 个；来源检查间隔 {self.settings.get("pipeline","poll_seconds",3600)} 秒')
+                if ready_event is not None:
+                    ready_event.set()
+                if once:
                     self.tick()
-                    stop_event.wait(self.settings.get('worker','idle_seconds',5))
-                except KeyboardInterrupt:
-                    log('后台已停止；未完成任务将在下次启动时恢复')
                     return
-                except Exception as exc:
-                    log(f'后台轮次失败：{type(exc).__name__}')
-                    stop_event.wait(self.settings.get('worker','idle_seconds',5))
-            log('后台已停止；未完成任务将在下次启动时恢复')
+                stop_event = stop_event or Event()
+                while not stop_event.is_set():
+                    try:
+                        self.tick()
+                        stop_event.wait(self.settings.get('worker','idle_seconds',5))
+                    except KeyboardInterrupt:
+                        log('后台已停止；未完成任务将在下次启动时恢复')
+                        return
+                    except Exception as exc:
+                        log(f'后台轮次失败：{type(exc).__name__}')
+                        stop_event.wait(self.settings.get('worker','idle_seconds',5))
+                log('后台已停止；未完成任务将在下次启动时恢复')
+        finally:
+            self.runtime.stop()
 
     def add_source(self,kind,target,name):
         kind,target,name=self.normalize_source(kind,target,name)
@@ -212,17 +276,33 @@ class DailyService:
             write_text(self.settings.content_dir/str(row['id'])/'feed.txt',item['body'])
         return inserted
 
-    def poll(self,day=None):
+    def poll(self,day=None,end_day=None,parent=''):
+        """检查来源；day与end_day同时给出时按日期区间收集，供范围重建一次扫完。
+
+        逐日调用会让每个来源被重复扫描N遍，区间模式把候选一次取回后按天归入，
+        既省请求又避免B站分页上限被多日重复消耗。
+        """
         now=time.time()
         result={'errors':[],'capped':False}
         start=datetime.strptime(normalize_day(day),'%Y-%m-%d').replace(tzinfo=TZ).timestamp() if day else None
+        end=None
+        if start is not None and end_day:
+            end_exclusive=datetime.strptime(normalize_day(end_day),'%Y-%m-%d').replace(tzinfo=TZ).timestamp()+86400
+            end=end_exclusive if end_exclusive>start else start+86400
         interval=self.settings.get('pipeline','poll_seconds',3600)
-        for source in self.store.sources():
-            if not source['enabled'] or (day is None and now-source['last_poll']<interval):continue
+        pending=[source for source in self.store.sources()
+                 if source['enabled'] and not (day is None and now-source['last_poll']<interval)]
+        if pending and parent!='rebuild':
+            # 普通轮次的来源检查自成一个活动；重建内的检查归属重建，避免状态串台。
+            self.runtime.begin('poll','检查订阅来源',day=day,stage='acquire',detail='读取启用来源')
+        for index,source in enumerate(pending,1):
+            self.runtime.update(detail=f'检查来源 {index}/{len(pending)}：{source["name"]}',current=index,total=len(pending))
+            self._touch_heartbeat()
             started=time.perf_counter()
             log(f'来源 {source["id"]}（{source["kind"]}）：开始检查新增内容')
             try:
-                cutoff=start if day else source['created']-self.settings.get('pipeline','lookback_hours',24)*3600
+                # 区间模式下回溯到区间起点，不再受首次24小时限制。
+                cutoff=start if start is not None else source['created']-self.settings.get('pipeline','lookback_hours',24)*3600
                 if source['kind']=='rss':items=discover(source['target'],now)
                 else:
                     client=self.bili();items=[]
@@ -243,7 +323,8 @@ class DailyService:
                 count=0
                 for item in sorted(items,key=lambda i:i['published']):
                     if item['published']<cutoff:continue
-                    if day and item['published']>=start+86400:continue
+                    if end is not None and item['published']>=end:continue
+                    if end is None and start is not None and item['published']>=start+86400:continue
                     if count>=self.settings.get('pipeline','per_source_limit',20):
                         if not self.store.query('SELECT id FROM tasks WHERE url=?',(item['url'],)):result['capped']=True
                         continue
@@ -257,11 +338,17 @@ class DailyService:
                 log(f"来源 {source['id']} 检查失败：{error}；耗时 {time.perf_counter()-started:.1f} 秒，按来源检查间隔等待重试")
         return result
 
-    def publish(self,day,force=False):
+    def publish(self,day,force=False,allow_empty=False):
         day=normalize_day(day)
         # 只发布成功摘要；单条缺失或损坏不能阻断整轮，也不能把已发布条目挤掉。
         tasks=self.store.query("SELECT * FROM tasks WHERE day=? AND status='done' ORDER BY published,id",(day,))
-        if not tasks:return None
+        if not tasks and not allow_empty:return None
+        # 上一条活动版本要在构造条目前读取：来源删除后重新发布时沿用其中记录的
+        # 来源名快照，否则同一篇历史内容会降级成“已删除的订阅来源”并被新版本固化。
+        last=self.store.latest(day)
+        previous=self._previous_entries(last)
+        historical={entry['id']:entry['source_name'] for entry in previous
+                    if entry.get('source_name') and isinstance(entry['source_name'],str)}
         entries=[]
         broken=[]
         for task in tasks:
@@ -272,18 +359,27 @@ class DailyService:
             except (OSError,TypeError,ValueError):
                 broken.append(task['id'])
                 continue
-            entries.append({'id':task['id'],'title':task['title'],'url':task['url'],'published':task['published'],'topic':result.get('topic'),'bullets':result['bullets'],'source_name':self.source_label(task)})
+            entries.append({'id':task['id'],'title':self._entry_title(task,result),'url':task['url'],'published':task['published'],'topic':result.get('topic'),'bullets':result['bullets'],'source_name':self._entry_source_name(task,historical)})
         if broken:
             log(f'日报 {day}：{len(broken)} 条已完成任务的摘要缺失或损坏，沿用其此前条目，待重建补齐')
         # 未成功（失败、重试中或摘要损坏）的任务继续展示上一次成功条目，日报不因处理失败而缩水。
-        last=self.store.latest(day)
-        previous=self._previous_entries(last)
         entries=self._merge_previous(entries,previous,{task['id'] for task in self.store.query('SELECT id FROM tasks WHERE day=?',(day,))})
+        # 撤回是发布层的否决，必须放在沿用旧条目之后，否则旧版本会把被撤内容带回来。
+        retracted=self.store.retracted_ids(day)
+        if retracted:
+            before=len(entries)
+            entries=[entry for entry in entries if entry['id'] not in retracted]
+            if len(entries)<before:log(f'日报 {day}：{before-len(entries)} 条已撤回条目未包含在本次发布')
         if len(entries)>len(tasks)-len(broken):
             log(f'日报 {day}：{len(entries)-(len(tasks)-len(broken))} 条未成功任务沿用上一次成功条目')
         if not entries:
-            # 没有任何可用条目时不发布空日报，保留上一版（若有）。
-            log(f'日报 {day}：没有可用摘要，本次不发布')
+            if not allow_empty:
+                # 没有任何可用条目时不发布空日报，保留上一版（若有）。
+                log(f'日报 {day}：没有可用摘要，本次不发布')
+                return None
+            # 撤回全部内容：不写空快照，只移除活动指针，归档导航随之不再列出该日。
+            self.store.clear_active(day)
+            log(f'日报 {day}：全部条目已撤回，该日不再展示；历史版本与产物保留')
             return None
         fingerprint=hashlib.sha256(json.dumps(entries,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
         final=is_final(day)
@@ -302,6 +398,27 @@ class DailyService:
         self.store.publish_version(day,path,fingerprint,final,snapshot['updated'])
         log(f'日报 {day}：发布完成，{len(entries)} 条内容，'+('定稿后补充' if snapshot['supplement'] else '已定稿' if final else '持续更新'))
         return self.store.latest(day)
+
+    @staticmethod
+    def _entry_title(task,result):
+        """标题优先用摘要里的模型标题：来源原始标题常是口语化、标题党或与正文不符。
+
+        历史摘要没有该字段，回退到任务保存的来源标题，保证旧日期不改写。
+        """
+        title=result.get('title') if isinstance(result,dict) else None
+        if isinstance(title,str) and title.strip():return title.strip()
+        return task['title']
+
+    def _entry_source_name(self,task,historical):
+        """来源名优先沿用该任务已发布过的快照。
+
+        来源被删除或改名后重新发布时，若重新推导就会把历史内容标成
+        “已删除的订阅来源”或新名字，等于改写历史。已发布过的名字更忠实；
+        只有从未发布过（新任务）或旧版本缺该字段时才回退推导。
+        """
+        published_name=historical.get(task['id'])
+        if published_name:return published_name
+        return self.source_label(task)
 
     @staticmethod
     def _previous_entries(last):
@@ -326,52 +443,164 @@ class DailyService:
         merged.sort(key=lambda entry:(entry.get('published',0),entry.get('id',0)))
         return merged
 
+    def retract_entry(self,task_id,reason=''):
+        """撤回单条已发布条目：只重算该日，不删除摘要、版本或任务行。
+
+        重复撤回按幂等处理：唯一一条被撤回后该日已无活动版本，此时再提交
+        同一条不应报错（否则刷新页面重发表单就会看到 409）。
+        """
+        task=self.store.task(task_id)
+        if task['status']=='canceled':
+            raise ValueError('该任务已因来源删除而取消，无需撤回')
+        if task['status']!='done':
+            raise ValueError('只能撤回已处理完成的条目')
+        already=task_id in self.store.retracted_ids(task['day'])
+        if not already:
+            if not self.store.latest(task['day']) and not self.store.versions(task['day']):
+                raise ValueError('该日期没有已发布日报')
+            self.store.retract(task_id,task['day'],reason)
+            self.store.event(task_id,'retract','ok',reason or '撤回条目')
+            log(f'条目 {task_id}：已撤回（{task["day"]}）')
+        return self.publish(task['day'],force=True,allow_empty=True)
+
+    def restore_entry(self,task_id):
+        """恢复已撤回条目；只会让日报增加内容，无需空日报例外。"""
+        task=self.store.task(task_id)
+        if not self.store.restore(task_id):
+            raise ValueError('该条目未被撤回')
+        self.store.event(task_id,'retract','restored','恢复条目')
+        log(f'条目 {task_id}：已恢复（{task["day"]}）')
+        return self.publish(task['day'],force=True)
+
     def request_rebuild(self,day):
         day=normalize_day(day)
         return self.store.request_rebuild(day)
+
+    def request_rebuild_range(self,days):
+        """重建最近若干天；按日展开并入同一批次。
+
+        只入队“有内容或已发布”的日期：完全空白的日期没有可核对产物，
+        入队只会产生一串必然失败的记录。
+        """
+        count=int(days)
+        if not 1<=count<=30:raise ValueError('重建天数需在 1 至 30 之间')
+        today=datetime.now(TZ).date()
+        candidates=[(today-timedelta(days=offset)).isoformat() for offset in range(count)]
+        known=self.store.days_with_content(candidates)
+        if not known:return []
+        batch=f'range-{int(time.time())}'
+        return self.store.request_rebuild_range(known,batch)
+
+    def request_rebuild_week(self):
+        """重建最近7天（含今天）的便捷入口。"""
+        return self.request_rebuild_range(7)
+
+    def _rebuild_inspection(self,request,day):
+        """范围重建时整批只扫一次来源，逐日重建仍按单日扫描。
+
+        逐日调用poll会把每个来源重复扫描N遍，既浪费请求，
+        也可能让B站分页上限被多日重复消耗。用meta记录批次已扫描的区间，
+        后续同批次任务直接复用一个空结果，不再触发来源请求。
+        """
+        batch=request.get('batch') or ''
+        if not batch:
+            return self.poll(day=day,parent='rebuild')
+        key=f'rebuild_scan:{batch}'
+        if self.store.meta(key):
+            return {'errors':[],'capped':False,'reused':True}
+        remaining=self.store.query("SELECT day FROM rebuilds WHERE batch=? AND status IN ('queued','running') "
+                                   'ORDER BY day',(batch,))
+        days=[row['day'] for row in remaining]
+        if not days:days=[day]
+        start,end=min(days),max(days)
+        log(f'批量重建：一次检查 {start} 至 {end} 的来源内容（共 {len(days)} 天）')
+        result=self.poll(day=start,end_day=end,parent='rebuild')
+        self.store.set_meta(key,str(time.time()))
+        return result
 
     def process_rebuild(self):
         request=self.store.claim_rebuild()
         if request is None:return False
         started=time.perf_counter()
-        log(f'日报 {request["day"]}：开始执行重建任务 {request["id"]}')
+        day=request['day']
+        self.runtime.begin('rebuild',f'重建日报 {day}',day=day,stage='acquire',detail='检查启用来源')
+        self._touch_heartbeat(force=True)
+        log(f'日报 {day}：开始执行重建任务 {request["id"]}')
         try:
-            log(f'日报 {request["day"]}：检查启用来源及已有处理产物')
-            inspection=self.poll(day=request['day'])
-            if self.pipeline is None:
-                from orchestration.pipeline import ContentPipeline
-                self.pipeline=ContentPipeline(self.settings,self.store)
-            tasks=self.store.query('SELECT * FROM tasks WHERE day=?',(request['day'],))
-            for task in tasks:
+            log(f'日报 {day}：检查启用来源及已有处理产物')
+            inspection=self._rebuild_inspection(request,day)
+            self._ensure_pipeline()
+            self.runtime.update(stage='check',detail='核对已有处理产物',current=None,total=None)
+            tasks=self.store.query('SELECT * FROM tasks WHERE day=?',(day,))
+            pending=[]
+            orphaned=0
+            for index,task in enumerate(tasks,1):
+                self._touch_heartbeat()
+                self.runtime.update(detail=f'核对产物 {index}/{len(tasks)}',current=index,total=len(tasks))
+                if task['source_id'] is not None and not self.store.source_exists(task['source_id']):
+                    # 来源已删除：不复活、不重抓，保持取消状态并计入未完成说明。
+                    if task['status']!='canceled':
+                        self.store.execute("UPDATE tasks SET status='canceled',available=0,"
+                                           "error='source: SourceDeleted',updated=? WHERE id=?",
+                                           (time.time(),task['id']))
+                    orphaned+=1
+                    log(f'任务 {task["id"]}：来源已删除，跳过重建')
+                    continue
                 missing=self.pipeline.repair_needed(task)
-                if task['status']!='done' or missing:
-                    self.store.execute("UPDATE tasks SET status='queued',available=0,attempts=0,error='' WHERE id=?",(task['id'],))
+                if task['status'] not in ('done','canceled') or missing:
+                    # 重建只重置本轮等待时间与错误，不重置累计尝试次数：
+                    # 否则每次重建都等于给失败任务一份全新的自动重试额度。
+                    total_limit=self.settings.get('worker','max_total_attempts',10)
+                    if task['status']=='failed' and task['attempts']>=total_limit:
+                        log(f'任务 {task["id"]}：已达终身尝试上限（{total_limit} 次），重建跳过')
+                        continue
+                    self.store.execute("UPDATE tasks SET status='queued',available=0,error='' WHERE id=?",(task['id'],))
+                    pending.append(task['id'])
                     log(f'任务 {task["id"]}：重建检查发现未完成或缺失产物，入队补齐')
                 else:log(f'任务 {task["id"]}：处理产物完整，复用已有结果')
+            self.runtime.update(stage='process',detail=f'待补齐 {len(pending)} 个任务',current=0,total=len(pending) or None)
+            done=0
             while True:
-                task=self.store.claim(day=request['day'])
+                task=self.store.claim(day=day)
                 if task is None:break
-                self.pipeline.run(task)
-                self.store.set_meta('heartbeat',time.time())
-            incomplete=self.store.query("SELECT id FROM tasks WHERE day=? AND status!='done'",(request['day'],))
+                done+=1
+                # _run_task 会以同一标签重建活动并带上当前任务号，进度不因切换而丢失。
+                self._run_task(task,parent='rebuild')
+                self.runtime.update(stage='process',detail=f'已处理 {done}/{len(pending) or done} 个任务',
+                                    current=done,total=len(pending) or done)
+            self.runtime.begin('rebuild',f'重建日报 {day}',day=day,stage='finish',detail='汇集并发布日报')
+            self._touch_heartbeat(force=True)
+            incomplete=self.store.query("SELECT id FROM tasks WHERE day=? AND status NOT IN ('done','canceled')",(day,))
             # 允许成功内容更新，失败任务与来源检查不冒充完整成功；publish沿用未成功任务的既有条目。
-            published=self.publish(request['day'],force=True)
+            published=self.publish(day,force=True)
             if inspection['errors'] or inspection['capped'] or incomplete:
                 message=f'来源失败 {len(inspection["errors"])} 个，未完成任务 {len(incomplete)} 个'
+                if orphaned:message+=f'；{orphaned} 个任务因来源已删除被跳过'
                 if inspection['capped']:message+='；达到单轮采集上限，请再次重建补齐'
                 if published is not None:message+='；已发布内容保留，未成功条目沿用上一次成功版本'
-                self.store.execute("UPDATE rebuilds SET status='failed',error=?,updated=? WHERE id=?",(message,time.time(),request['id']))
-                log(f'日报 {request["day"]}：重建未全部完成，{message}；已有日报保留')
+                self.store.finish_rebuild(request['id'],'failed',message)
+                log(f'日报 {day}：重建未全部完成，{message}；已有日报保留')
                 return True
             if published is None:
-                self.store.execute("UPDATE rebuilds SET status='failed',error=?,updated=? WHERE id=?",('指定日期未发现可发布内容',time.time(),request['id']))
-                log(f'日报 {request["day"]}：未发现可发布内容，已有日报保留')
+                message='指定日期未发现可发布内容'
+                if orphaned:message+=f'；{orphaned} 个任务因来源已删除被跳过'
+                self.store.finish_rebuild(request['id'],'failed',message)
+                log(f'日报 {day}：{message}，已有日报保留')
                 return True
-            self.store.execute("UPDATE rebuilds SET status='done',error='',updated=? WHERE id=?",(time.time(),request['id']))
-            log(f'日报 {request["day"]}：重建完成，耗时 {time.perf_counter()-started:.1f} 秒')
+            self.store.finish_rebuild(request['id'],'done','')
+            log(f'日报 {day}：重建完成，耗时 {time.perf_counter()-started:.1f} 秒')
         except Exception as exc:
-            self.store.execute("UPDATE rebuilds SET status='failed',error=?,updated=? WHERE id=?",(type(exc).__name__,time.time(),request['id']))
-            log(f'日报 {request["day"]}：重建失败（{type(exc).__name__}），原日报保留')
+            self.store.finish_rebuild(request['id'],'failed',type(exc).__name__)
+            log(f'日报 {day}：重建失败（{type(exc).__name__}），原日报保留')
+        finally:
+            # 批次最后一目完成后才退回扫描标记，避免下一目重复扫描来源。
+            batch=request.get('batch') or ''
+            if batch:
+                left=self.store.query("SELECT id FROM rebuilds WHERE batch=? AND status IN ('queued','running')",(batch,))
+                if not left:
+                    self.store.execute("DELETE FROM meta WHERE key=?",(f'rebuild_scan:{batch}',))
+            self.runtime.finish('空闲','等待下一轮调度')
+            self._touch_heartbeat(force=True)
         return True
 
     def report(self,day=None):
@@ -399,48 +628,250 @@ class DailyService:
         return 'B站 · 单独提交' if task['kind']=='bili' else 'RSS · 单独提交'
 
     def dates(self):
-        return [r['day'] for r in self.store.query('SELECT DISTINCT day FROM versions ORDER BY day DESC')]
+        """只列有活动版本的日期；无活动版本的日期不再出现在归档导航，避免死链。"""
+        return [r['day'] for r in self.store.query(
+            'SELECT DISTINCT day FROM versions WHERE active=1 ORDER BY day DESC')]
+
+    def briefing(self,day=None):
+        """公开日报页的唯一数据入口：分组、统计、翻页、归档一次算清。
+
+        分组不能放在模板里：Jinja 的 groupby 会先按 key 排序，条目缺
+        topic（None）时与字符串比较直接抛 TypeError，整页 500。
+        """
+        dates=self.dates()
+        latest=dates[0] if dates else None
+        target=day or latest
+        report=self.report(target) if target else None
+        return {'report':report,
+                'sections':self.sections(report),
+                'stats':self.report_stats(report,dates),
+                'neighbors':self.neighbors(target,dates),
+                'archive':self._archive(dates,target if report else latest),
+                'dates':dates,'latest':latest,'today':day_of(time.time())}
+
+    @staticmethod
+    def sections(report):
+        """按 TOPIC_ORDER 分节；缺失或未知主题归入“其他”，不参与排序。"""
+        buckets={topic:[] for topic in TOPIC_ORDER}
+        for entry in (report or {}).get('entries',[]):
+            buckets[topic_name(entry.get('topic'))].append(entry)
+        return [{'topic':topic,'entries':buckets[topic]} for topic in TOPIC_ORDER if buckets[topic]]
+
+    @staticmethod
+    def report_stats(report,dates=None):
+        entries=(report or {}).get('entries',[]) or []
+        stamps=[float(entry['published']) for entry in entries
+                if isinstance(entry.get('published'),(int,float)) and entry['published']>0]
+        return {'entries':len(entries),
+                'sources':len({entry.get('source_name') for entry in entries if entry.get('source_name')}),
+                'topics':len({topic_name(entry.get('topic')) for entry in entries}),
+                'first':min(stamps) if stamps else None,
+                'last':max(stamps) if stamps else None,
+                'archive_days':len(dates or [])}
+
+    @staticmethod
+    def neighbors(day,dates=None):
+        """归档日期是倒序的：prev 指更早一天，next 指更新一天。"""
+        values=list(dates or [])
+        if not day or day not in values:return {'prev':None,'next':None}
+        index=values.index(day)
+        return {'prev':values[index+1] if index+1<len(values) else None,
+                'next':values[index-1] if index>0 else None}
+
+    def archive(self,active_day=None):
+        return self._archive(self.dates(),active_day)
+
+    @staticmethod
+    def _archive(dates,active_day=None):
+        """把归档日期组织成年→月两层，供侧栏折叠展示。
+
+        只读 dates()，不改公开 /api/public/days 的扁平数组契约。
+        当前查看日期所在的年与月标记为展开，其余默认收起，
+        这样归档多时侧栏不会一次铺开成几十行。
+        """
+        years={}
+        for day in dates:
+            years.setdefault(day[:4],{}).setdefault(day[5:7],[]).append(day)
+        tree=[]
+        for year in sorted(years,reverse=True):
+            months=[]
+            for month in sorted(years[year],reverse=True):
+                days=years[year][month]
+                months.append({'key':f'{year}-{month}','month':month,'days':days,'count':len(days),
+                               'open':bool(active_day and active_day[:7]==f'{year}-{month}')})
+            tree.append({'year':year,'months':months,'count':sum(item['count'] for item in months),
+                         'open':bool(active_day and active_day[:4]==year)})
+        return tree
 
     def preview(self):
         report=self.report()
         if not report:return {'day':None,'count':0,'titles':[],'updated':None}
         return {key:report[key] for key in ('day','updated','final')}|{'count':len(report['entries']),'titles':[e['title'] for e in report['entries'][:3]]}
 
-    def dashboard(self):
-        return {'sources':self.store.sources(),'tasks':self.store.query('SELECT * FROM tasks ORDER BY id DESC LIMIT 100'),'rebuilds':self.store.query('SELECT * FROM rebuilds ORDER BY id DESC LIMIT 20'),'dates':self.dates(),'worker_heartbeat':self.store.meta('heartbeat'),'configured':{'asr':bool(self.settings.asr_key),'llm':bool(self.settings.llm_key)}}
+    def dashboard(self, view='all', day=None):
+        """管理页唯一数据来源；不含凭据，不触发采集、模型调用或配置变更。"""
+        counts=self.store.task_counts()
+        tasks=self.store.dashboard_tasks(view,day)
+        now=time.time()
+        total_limit=self.settings.get('worker','max_total_attempts',10)
+        for task in tasks:
+            task['exhausted']=task['status']=='failed' and task['attempts']>=total_limit
+            task.update(task_state(task,now))
+            task['error_text']=explain_error(task.get('error'))
+            task['warning_text']=task.get('warning') or ''
+            task['stage_text']=stage_label(task.get('stage'))
+        rebuilds=self.store.rebuilds(20)
+        progress=self.store.day_progress([job['day'] for job in rebuilds])
+        for job in rebuilds:
+            job.update(rebuild_state(job,now))
+            job['error_text']=explain_error(job.get('error'))
+            total,done=progress.get(job['day'],(0,0))
+            job['total'],job['done']=total,done
+            job['progress']=round(100*done/total) if total else None
+        return {'sources':self.store.sources(),'tasks':tasks,'task_counts':counts,'view':view,'day_filter':day or '',
+                'rebuilds':rebuilds,'active_rebuilds':self.store.active_rebuilds(),
+                'events':self.store.recent_events(8),'dates':self.dates(),
+                'worker_heartbeat':self.store.meta('heartbeat'),'activity':self.runtime.snapshot(),
+                'configured':{'asr':bool(self.settings.asr_key),'llm':bool(self.settings.llm_key)},
+                'llm':self.settings.llm_state(),'storage':self.storage_state(),'now':now}
+
+    def activity_status(self):
+        """轻量实时状态；供管理页高频轮询，不读取任务列表或日报。"""
+        snapshot=self.runtime.snapshot()
+        snapshot['task_counts']=self.store.task_counts()
+        active=self.store.active_rebuilds()
+        progress=self.store.day_progress([job['day'] for job in active])
+        snapshot['active_rebuilds']=[]
+        for job in active:
+            item={**job,**rebuild_state(job)}
+            total,done=progress.get(job['day'],(0,0))
+            item['total'],item['done']=total,done
+            item['progress']=round(100*done/total) if total else None
+            snapshot['active_rebuilds'].append(item)
+        snapshot['worker_heartbeat']=self.store.meta('heartbeat')
+        snapshot['llm']=self.settings.llm_state()
+        snapshot['now']=time.time()
+        return snapshot
+
+    def reload_model_config(self):
+        """管理页手动触发模型配置重载；处理中只登记待应用，失败保留旧配置。"""
+        activity=self.runtime.snapshot()
+        if activity['kind'] in ('task','rebuild'):
+            self._config_deferred=True
+            log('文本模型配置重载已登记：当前任务结束后应用，避免同一份摘要混用两个模型')
+            return False,self.settings.llm_state(),True
+        changed,state=self._apply_config(force=True)
+        return changed,state,False
+
+    def _apply_config(self, force=False):
+        before=self.settings.llm_revision
+        changed=self.settings.refresh_llm(force=force)
+        state=self.settings.llm_state()
+        self._config_deferred=bool(state.get('pending'))
+        if changed and state['revision']!=before:
+            log(f'文本模型配置已热加载：版本 {state["revision"]}，模型 {state["model"]}')
+        elif state['error'] and state['error']!=self._config_error_logged:
+            log(f'文本模型配置热加载失败：{state["error"]}；继续使用上一版配置')
+        self._config_error_logged=state['error'] if state['error'] else ''
+        return changed,state
 
     def source_action(self,source_id,action):
-        if action=='delete':self.store.execute('DELETE FROM sources WHERE id=?',(source_id,))
+        if action=='delete':
+            self.store.delete_source(source_id)
+            log(f'来源 {source_id}：已删除，其未处理任务已取消；已发布日报保留')
         elif action=='toggle':self.store.execute('UPDATE sources SET enabled=1-enabled WHERE id=?',(source_id,))
         elif action=='refresh':self.store.execute('UPDATE sources SET last_poll=0 WHERE id=?',(source_id,))
         else:raise ValueError('未知操作')
 
-    def retry(self,task_id):self.store.retry(task_id)
+    def retry(self,task_id):
+        """手动重试；达到终身上限的任务拒绝再次排队，避免无限重试。"""
+        task=self.store.task(task_id)
+        total_limit=self.settings.get('worker','max_total_attempts',10)
+        if task['status']=='failed' and task['attempts']>=total_limit:
+            raise ValueError(f'该任务已尝试 {task["attempts"]} 次，达到上限；请修正原因后重建该日日报')
+        self.store.retry(task_id)
 
     def tick(self):
-        self.store.set_meta('heartbeat',time.time())
+        """单轮调度；活动标签只描述实际执行的步骤，不在无事可做时声称正在检查。"""
+        self.refresh_config()
+        self._touch_heartbeat(force=True)
+        canceled=self.store.cancel_orphan_tasks()
+        if canceled:log(f'清理：{canceled} 个排队任务的来源已不存在，已取消')
         rebuilt=self.process_rebuild()
         if rebuilt:self._waiting=False
         self.poll()
         task=self.store.claim()
         if task:
             self._waiting=False
-            if self.pipeline is None:
-                from orchestration.pipeline import ContentPipeline
-                self.pipeline=ContentPipeline(self.settings,self.store)
-            self.pipeline.run(task)
+            self._run_task(task)
         elif not self._waiting:
             queued=len(self.store.query("SELECT id FROM tasks WHERE status='queued'"))
             log(f'等待中：暂无可立即执行的任务，待重试 {queued} 个；将自动检查新任务和到期来源')
             self._waiting=True
-        self.publish_dirty()
+            self.runtime.finish('空闲',f'待重试 {queued} 个任务；将自动检查新任务和到期来源')
+        else:
+            self.runtime.finish('空闲','等待下一轮调度')
+        if self.store.done_signature()!=self._publish_signature:
+            self.runtime.begin('publish','发布日报',detail='汇集已完成摘要')
+            self._touch_heartbeat(force=True)
+            self.publish_dirty()
+            self.runtime.finish('空闲','等待下一轮调度')
         # tick仅由持锁Worker执行；此时没有运行中的下载或模型调用。
         if time.time()-self._cleanup_at>=3600:
-            from integration.cleanup import cleanup
+            self.run_cleanup()
+        self._touch_heartbeat(force=True)
+
+    def run_cleanup(self):
+        """执行一次空间清理并记录可核对的结果；Web手动入口与定时任务共用。"""
+        from integration.cleanup import cleanup, disk_usage
+        started=time.time()
+        self._cleanup_at=started
+        self.runtime.begin('cleanup','清理存储空间',detail='按保留期删除可再生产物')
+        self._touch_heartbeat(force=True)
+        try:
             result=cleanup(self.settings,self.store.query('SELECT id,status FROM tasks'))
-            self.store.prune_events(time.time()-30*86400)
-            self._cleanup_at=time.time()
-            if result['files']:log(f'空间清理：移除 {result["files"]} 个缓存文件，释放 {result["bytes"]/1048576:.1f} MB')
+            self.store.prune_events(started-30*86400)
+            usage=disk_usage(self.settings)
+            self.store.set_meta('cleanup_at',started)
+            self.store.set_meta('cleanup_files',result['files'])
+            self.store.set_meta('cleanup_bytes',result['bytes'])
+            self.store.set_meta('cleanup_usage',usage['total'])
+            self.store.set_meta('cleanup_error','')
+            if result['files']:
+                log(f'空间清理：移除 {result["files"]} 个文件，释放 {result["bytes"]/1048576:.1f} MB；'
+                    f'当前占用 {usage["total"]/1048576:.1f} MB')
+            else:
+                log(f'空间清理：没有可移除的文件；当前占用 {usage["total"]/1048576:.1f} MB')
+            return result
+        except Exception as exc:
+            # 清理失败不能影响后续轮次；按异常类型记录，不写文件内容。
+            self.store.set_meta('cleanup_error',type(exc).__name__)
+            log(f'空间清理失败（{type(exc).__name__}），下一轮继续')
+            return None
+        finally:
+            self.runtime.finish('空闲','等待下一轮调度')
+            self._touch_heartbeat(force=True)
+
+    def storage_state(self):
+        """管理页存储卡片：保留期设置、上次清理结果与当前占用。"""
+        from integration.cleanup import disk_usage
+        usage=disk_usage(self.settings)
+        last=float(self.store.meta('cleanup_at') or 0)
+        return {
+            'usage':usage,
+            'retention':{
+                'transcript_days':self.settings.get('storage','transcript_days',30),
+                'intermediate_days':self.settings.get('storage','intermediate_days',7),
+                'report_days':self.settings.report_retention_days,
+                'cache_days':self.settings.get('storage','cache_days',1),
+                'cache_max_mb':self.settings.get('storage','cache_max_mb',512),
+            },
+            'last_cleanup':last,
+            'last_files':self.store.meta('cleanup_files') or '0',
+            'last_bytes':self.store.meta('cleanup_bytes') or '0',
+            'last_error':self.store.meta('cleanup_error') or '',
+            'next_cleanup':(last or time.time())+3600,
+        }
 
     def publish_dirty(self,force=False):
         """只重算完成状态变化的日期；逐日隔离异常，单日失败不阻断其他日期。"""

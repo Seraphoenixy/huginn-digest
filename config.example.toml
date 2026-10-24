@@ -48,9 +48,16 @@ model = "deepseek-v4.1-flash"
 timeout = 120
 thinking_disabled = true
 chunk_chars = 12000
+# 本段支持运行中热加载：保存后后台在任务间隙自动应用，也可在管理页手动重新读取。
+# 处理中的任务不会中途换模型；解析或校验失败时继续使用上一版并在管理页显示原因。
+# 其他段落仍需重启进程。
 [worker]
 idle_seconds = 5
+# 单次处理允许的自动重试次数（含首次，实际最多尝试这么多次）。
 max_attempts = 3
+# 同一任务的终身尝试上限，含管理页手动重试与重建补齐；达到后不再排队。
+# 用于防止反复点“重试”造成无上限的重复尝试。
+max_total_attempts = 10
 
 # 运行 huginn-digest setup-admin 自动填写哈希和会话密钥（源码：python -m interaction.secrets_cli）。
 [security]
@@ -69,7 +76,15 @@ refresh_retry_seconds = 3600
 
 [storage]
 data_dir = "data"
-# 仅控制可再生产物，不删除原稿、纠错稿、当前摘要和活动日报版本。
+# 仅控制可再生产物，不删除当前摘要和活动日报版本。
 cache_days = 1
 intermediate_days = 7
 cache_max_mb = 512
+# 转写原文与纠错稿的保留天数。这类文件体积最大（单条约90KB），日报展示不依赖它们，
+# 只在“重建日报”时用于避免重复下载与 ASR。0 表示永久保留（升级前的行为）。
+# 超期后由清理任务删除；该日重建会重新采集与转写，已发布日报不受影响。
+transcript_days = 30
+# 日报保留天数上限（默认约3年）。单条约1.6KB，每天20条约32KB；3年约35MB。
+# 到期后该日的版本、日报快照与对应任务索引一并删除，归档导航中不再出现。
+# 0 表示永久保留（升级前的行为）。删除后该日期无法再重建恢复。
+report_days = 1095
