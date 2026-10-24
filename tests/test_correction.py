@@ -99,7 +99,7 @@ class CorrectionTests(unittest.TestCase):
                 self.pipeline.llm.call=Mock(return_value=bad)
                 result=self.correct()
                 self.assertEqual(read_text(result['corrected_path']),self.original)
-                self.assertIn('纠错失败',self.service.store.task(self.task['id'])['warning'])
+                self.assertIn('未采用',self.service.store.task(self.task['id'])['warning'])
                 self.assertFalse(self.manifest()['complete'])
 
     def test_transport_failure_falls_back_without_leaking_error(self):
@@ -148,7 +148,7 @@ class CorrectionTests(unittest.TestCase):
     def test_rebuild_checks_correction_signature_and_keeps_manifest(self):
         self.pipeline.llm.call=Mock(side_effect=self.identity_model)
         corrected=self.correct()
-        self.pipeline.llm.call=Mock(return_value=json.dumps({'topic':'技术','title':'离线摘要标题','bullets':['离线摘要']}))
+        self.pipeline.llm.call=Mock(return_value=json.dumps({'topic':'AI 与大模型','title':'离线摘要标题','bullets':['离线摘要']}))
         self.pipeline.summarize(self.state|corrected)
         self.assertFalse(self.pipeline.repair_needed(self.task))
         self.assertTrue((self.folder/'correction_manifest.json').exists())
@@ -184,7 +184,7 @@ class CorrectionTests(unittest.TestCase):
 
     def test_graph_keeps_text_on_disk_and_reuses_completed_correction_after_chunk_cleanup(self):
         def model(system,payload,json_mode=False):
-            if json_mode:return json.dumps({'topic':'技术','title':'离线要点标题','bullets':['离线要点']})
+            if json_mode:return json.dumps({'topic':'AI 与大模型','title':'离线要点标题','bullets':['离线要点']})
             return self.identity_model(system,payload)
         self.pipeline.llm.call=Mock(side_effect=model)
         result=self.pipeline.graph.invoke({'task_id':self.task['id']})

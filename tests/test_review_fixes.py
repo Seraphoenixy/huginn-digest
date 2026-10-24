@@ -33,7 +33,7 @@ def add_done(service, url, bullets=None, day_stamp=None):
     service.enqueue('rss', {'url': url, 'title': url, 'published': stamp})
     task = service.store.query('SELECT * FROM tasks WHERE url=?', (url,))[0]
     path = service.settings.content_dir / str(task['id']) / 'summary.json'
-    write_text(path, json.dumps({'topic': '技术', 'bullets': bullets or [url]}, ensure_ascii=False))
+    write_text(path, json.dumps({'topic': 'AI 与大模型', 'bullets': bullets or [url]}, ensure_ascii=False))
     service.store.update(task['id'], status='done', summary_path=str(path))
     return dict(service.store.task(task['id']), summary_path=str(path))
 
@@ -358,7 +358,6 @@ class ConfigRobustnessTests(unittest.TestCase):
     def test_missing_site_urls_render_pages_instead_of_500(self):
         with tempfile.TemporaryDirectory() as directory:
             text = self.template().replace('public_url = "https://daily.example.com"\n', '')
-            text = text.replace('nav_url = "https://nav.example.com"\n', '')
             path = self.write(directory, text)
             settings = Settings(config_file=path, data_dir=Path(directory) / 'data')
             self.assertEqual(settings.site_public_url, '')

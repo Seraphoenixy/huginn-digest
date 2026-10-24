@@ -1,22 +1,23 @@
 {% extends 'base.html' %}{% block content %}
-<div class="page-head"><span class="eyebrow">WORKSPACE / 日报管理</span><h1>让信息按时抵达。</h1><p class="meta">当前动作、阶段与队列来自后台进程实时状态；任务历史来自数据库。</p></div>
+<div class="page-head"><span class="eyebrow">WORKSPACE</span><h1>让信息按时抵达。</h1></div>
 
 <p id="dashboard-refresh-status" class="meta" role="status" aria-live="polite" data-refresh-seconds="{{ admin_refresh_seconds }}" data-live-endpoint="/admin/status">状态自动更新中</p>
 
-<div class="card activity" data-live-region="heartbeat">
-<div class="activity__head">
+<div class="card status" data-live-region="heartbeat">
+<div class="status__row">
 <span class="state state--{{ 'ok' if activity.worker_alive else 'danger' }}" id="activity-worker">
 <span class="state__dot" aria-hidden="true"></span>{{ '后台运行中' if activity.worker_alive else '后台未运行' }}</span>
-<span class="meta">心跳 <span id="activity-heartbeat">{{ worker_heartbeat|ago if worker_heartbeat else '尚未启动' }}</span> · 已运行 <span id="activity-elapsed">{{ activity.elapsed|duration if activity.kind not in ('idle','stopped') else '—' }}</span></span>
+<span class="status__meta">心跳 <span id="activity-heartbeat">{{ worker_heartbeat|ago if worker_heartbeat else '尚未启动' }}</span> · 已运行 <span id="activity-elapsed">{{ activity.elapsed|duration if activity.kind not in ('idle','stopped') else '—' }}</span></span>
 </div>
-<div class="activity__now">
-<div class="activity__action"><span class="activity__label" id="activity-label">{{ activity.label }}</span><span class="activity__detail" id="activity-detail">{{ activity.detail }}</span>{% if activity.task_id %}<span class="meta">#{{ activity.task_id }} {{ activity.title }}{% if activity.day %} · {{ activity.day }}{% endif %}</span>{% elif activity.day %}<span class="meta">{{ activity.day }}</span>{% endif %}</div>
-<div class="activity__progress">
+<div class="status__action">
+<span class="status__label" id="activity-label">{{ activity.label }}</span>
+<span class="status__detail" id="activity-detail">{{ activity.detail }}</span>{% if activity.task_id %}<span class="meta">#{{ activity.task_id }} {{ activity.title }}{% if activity.day %} · {{ activity.day }}{% endif %}</span>{% elif activity.day %}<span class="meta">{{ activity.day }}</span>{% endif %}
+</div>
+<div class="status__progress">
 <div class="progress" role="progressbar" aria-label="当前进度"{% if activity.progress is not none %} aria-valuenow="{{ activity.progress }}" aria-valuemin="0" aria-valuemax="100"{% endif %}><div class="progress__bar{% if activity.progress is none %} progress__bar--idle{% endif %}" id="activity-bar" style="width:{{ activity.progress if activity.progress is not none else 8 }}%"></div></div>
 <span class="meta" id="activity-stage">{% if activity.stage %}{{ activity.stage_label }}{% if activity.current is not none and activity.total %} · {{ activity.current }}/{{ activity.total }}{% endif %}{% else %}—{% endif %}</span>
 </div>
-</div>
-<div class="activity__chips" id="activity-counts">
+<div class="status__chips" id="activity-counts">
 <span class="chip chip--run">处理中 {{ task_counts.running }}</span>
 <span class="chip chip--warn">等待 {{ task_counts.queued }}</span>
 <span class="chip chip--danger">失败 {{ task_counts.failed }}</span>
@@ -26,93 +27,142 @@
 {% if activity.last and activity.kind in ('idle','stopped') %}<p class="meta">上一轮：{{ activity.last.label }}{% if activity.last.detail %} · {{ activity.last.detail }}{% endif %} · {{ activity.last.at|beijing_time }}</p>{% endif %}
 </div>
 
-<div class="card">
+<div class="card" data-live-region="llm-card">
 <div class="card__head">
-<div><h2 class="card__title">摘要模型与转写</h2><p class="meta">修改 config.toml 的 [llm] 段后自动热加载；处理中的任务完成后才切换，避免同一份摘要混用两个模型。ASR 段修改后需重启。</p></div>
+<div><h2 class="card__title">摘要与转写模型</h2></div>
 <div class="activity__model">
-<span class="state state--{{ 'ok' if llm.configured else 'warn' }}"><span class="state__dot" aria-hidden="true"></span>模型{{ '已配置' if llm.configured else '未配置 Key' }}</span>
-<span class="state state--{{ 'ok' if configured.asr else 'warn' }}"><span class="state__dot" aria-hidden="true"></span>ASR{{ '已配置' if configured.asr else '未配置 Key' }}</span>
+<span class="state state--{{ 'ok' if llm.configured else 'warn' }}"><span class="state__dot" aria-hidden="true"></span>文本模型{{ '已配置' if llm.configured else '未配置 Key' }}</span>
+<span class="state state--{{ 'ok' if asr.configured else 'warn' }}"><span class="state__dot" aria-hidden="true"></span>转写{{ '已配置' if asr.configured else '未配置 Key' }}</span>
 {% if llm.error %}<span class="pill pill--danger">加载失败：{{ llm.error }}</span>{% elif llm.pending %}<span class="pill pill--muted">有变更待应用</span>{% endif %}
 </div>
 </div>
-{% if not configured.asr %}<p class="meta text-danger">未配置 ASR Key：涉及视频的任务会在转写阶段失败，RSS 文本任务不受影响。</p>{% endif %}
-<dl class="kv">
-<div><dt>当前模型</dt><dd id="llm-model">{{ llm.model or '—' }}</dd></div>
-<div><dt>接口主机</dt><dd>{{ llm.host or '—' }}</dd></div>
-<div><dt>配置版本</dt><dd>第 {{ llm.revision }} 版</dd></div>
-<div><dt>最近重载</dt><dd>{{ llm.reloaded_at|beijing_datetime }}</dd></div>
-</dl>
-<form class="form-row" method="post" action="/admin/config/reload"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--subtle btn--sm">立即重新读取配置</button><span class="meta">失败时保留上一版并显示原因，不影响正在处理的任务。</span></form>
+{% if not asr.configured %}<p class="meta text-danger">未配置转写 Key：涉及视频的任务会在转写阶段失败。</p>{% endif %}
+<div class="model-list">
+<div class="model-row">
+<p class="model-row__name">摘要</p>
+<form class="form-row" method="post" action="/admin/config/models" data-async>
+<input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}">
+<input name="llm_base_url" value="{{ llm.base_url or '' }}" maxlength="{{ web_limits.target_chars }}" aria-label="文本模型接口地址" placeholder="接口地址">
+<input name="llm_model" value="{{ llm.model or '' }}" maxlength="{{ web_limits.source_name_chars }}" aria-label="文本模型名称" placeholder="模型名称">
+<input type="password" name="llm_key" maxlength="{{ web_limits.target_chars }}" autocomplete="new-password" aria-label="文本模型 Key" placeholder="{{ 'Key 已隐藏，留空保持不变' if llm.configured else 'Key 未配置，粘贴后保存' }}">
+<button class="btn btn--sm">保存</button>
+</form>
+</div>
+<div class="model-row">
+<p class="model-row__name">转写</p>
+<form class="form-row" method="post" action="/admin/config/models" data-async>
+<input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}">
+<input name="asr_base_url" value="{{ asr.base_url or '' }}" maxlength="{{ web_limits.target_chars }}" aria-label="转写接口地址" placeholder="接口地址">
+<input name="asr_model" value="{{ asr.model or '' }}" maxlength="{{ web_limits.source_name_chars }}" aria-label="转写模型名称" placeholder="模型名称">
+<input type="password" name="asr_key" maxlength="{{ web_limits.target_chars }}" autocomplete="new-password" aria-label="转写 Key" placeholder="{{ 'Key 已隐藏，留空保持不变' if asr.configured else 'Key 未配置，粘贴后保存' }}">
+<button class="btn btn--sm">保存</button>
+</form>
+</div>
+</div>
+<div class="card__foot">
+<span class="meta">第 {{ llm.revision }} 版 · {{ llm.reloaded_at|beijing_datetime }}</span>
+<form class="inline" method="post" action="/admin/config/reload" data-async><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--subtle btn--sm">重新读取</button></form>
+</div>
 </div>
 
-<div class="card">
+<div class="card" data-live-region="storage-card">
 <div class="card__head">
-<div><h2 class="card__title">存储与保留</h2><p class="meta">到期内容由后台每小时自动清理；也可立即执行一次。删除不可恢复。</p></div>
+<div><h2 class="card__title">存储与保留</h2></div>
 <div class="activity__model">
 <span class="state state--{{ 'danger' if storage.last_error else 'ok' }}"><span class="state__dot" aria-hidden="true"></span>{% if storage.last_error %}上次清理失败：{{ storage.last_error }}{% else %}上次清理 {{ storage.last_cleanup|ago if storage.last_cleanup else '尚未执行' }}{% endif %}</span>
 </div>
 </div>
-<dl class="kv">
-<div><dt>数据目录占用</dt><dd>{{ (storage.usage.total / 1048576)|round(1) }} MB</dd></div>
-<div><dt>转写原文</dt><dd>{{ (storage.usage.buckets.transcripts / 1048576)|round(1) }} MB<small> · {{ storage.usage.counts.transcripts }} 个文件</small></dd></div>
-<div><dt>摘要与快照</dt><dd>{{ ((storage.usage.buckets.summaries + storage.usage.buckets.reports) / 1048576)|round(1) }} MB</dd></div>
-<div><dt>下载缓存</dt><dd>{{ (storage.usage.buckets.cache / 1048576)|round(1) }} MB</dd></div>
-<div><dt>数据库</dt><dd>{{ (storage.usage.buckets.database / 1048576)|round(1) }} MB</dd></div>
-<div><dt>上次释放</dt><dd>{{ (storage.last_bytes|int / 1048576)|round(1) }} MB<small> · {{ storage.last_files }} 个文件</small></dd></div>
-<div><dt>下次自动清理</dt><dd>{{ storage.next_cleanup|beijing_time }}</dd></div>
-</dl>
-<p class="meta">保留期：转写 {{ storage.retention.transcript_days }} 天 · 分片与历史版本 {{ storage.retention.intermediate_days }} 天 · 日报 {{ storage.retention.report_days }} 天{% if storage.retention.report_days == 0 %}（永久）{% endif %} · 缓存 {{ storage.retention.cache_days }} 天（上限 {{ storage.retention.cache_max_mb }} MB）。在 config.toml 的 [storage] 段调整后需重启。</p>
-<form class="form-row" method="post" action="/admin/cleanup"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--subtle btn--sm">立即清理一次</button><span class="meta">只删除超过保留期的转写、分片、缓存与到期日报；当前日报与摘要不受影响。</span></form>
+<div class="settings-rows">
+<div class="settings-row"><span class="settings-row__label">合计</span><span class="settings-row__value">{{ (storage.usage.total / 1048576)|round(2) }} MB</span></div>
+<div class="settings-row"><span class="settings-row__label">转写原文</span><span class="settings-row__value">{{ (storage.usage.buckets.transcripts / 1048576)|round(2) }} MB<small> · {{ storage.usage.counts.transcripts }} 个文件</small></span></div>
+<div class="settings-row"><span class="settings-row__label">摘要与快照</span><span class="settings-row__value">{{ (storage.usage.buckets.summaries / 1048576)|round(2) }} MB<small> · 摘要 {{ storage.usage.counts.summaries }} 个文件</small></span></div>
+<div class="settings-row"><span class="settings-row__label">已发布日报</span><span class="settings-row__value">{{ (storage.usage.buckets.reports / 1048576)|round(2) }} MB<small> · {{ storage.usage.counts.reports }} 个快照</small></span></div>
+<div class="settings-row"><span class="settings-row__label">下载缓存</span><span class="settings-row__value">{{ (storage.usage.buckets.cache / 1048576)|round(2) }} MB<small> · {{ storage.usage.counts.cache }} 个文件</small></span></div>
+<div class="settings-row"><span class="settings-row__label">数据库</span><span class="settings-row__value">{{ (storage.usage.buckets.database / 1048576)|round(2) }} MB</span></div>
+<div class="settings-row"><span class="settings-row__label">其他文件</span><span class="settings-row__value">{{ (storage.usage.buckets.other / 1048576)|round(2) }} MB<small>{% if storage.usage.buckets.other %} · 不属于上述分类，不会被清理{% endif %}</small></span></div>
+</div>
+<div class="settings-rows settings-rows--muted">
+<div class="settings-row"><span class="settings-row__label">上次释放</span><span class="settings-row__value">{{ (storage.last_bytes|int / 1048576)|round(2) }} MB<small> · {{ storage.last_files }} 个文件</small></span></div>
+<div class="settings-row"><span class="settings-row__label">下次自动清理</span><span class="settings-row__value">{{ storage.next_cleanup|beijing_time }}</span></div>
+</div>
+<div class="card__foot">
+<span class="meta">保留期：转写 {{ storage.retention.transcript_days }} 天 · 分片与历史版本 {{ storage.retention.intermediate_days }} 天 · 日报 {{ storage.retention.report_days }} 天{% if storage.retention.report_days == 0 %}（永久）{% endif %} · 缓存 {{ storage.retention.cache_days }} 天（上限 {{ storage.retention.cache_max_mb }} MB）</span>
+<form class="inline" method="post" action="/admin/cleanup" data-async><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--subtle btn--sm">立即清理</button></form>
+</div>
 </div>
 
 <div class="grid-2">
-<div class="card"><h2 class="card__title">添加订阅</h2><p class="meta">首次检查最近24小时，每个来源每轮最多新增20条。</p><form class="form-row" method="post" action="/admin/sources"><input type="hidden" name="token" value="{{ csrf }}"><select name="kind"><option value="bili">B站UP主</option><option value="rss">RSS订阅</option></select><input name="target" maxlength="{{ web_limits.target_chars }}" placeholder="MID、空间链接或RSS地址" required><input name="name" maxlength="{{ web_limits.source_name_chars }}" placeholder="显示名称"><button class="btn">添加来源</button></form></div>
-<div class="card"><h2 class="card__title">处理指定视频</h2><p class="meta">只处理该 BV 号及其分P，不扫描该 UP 主的其他投稿。</p><form class="form-row" method="post" action="/admin/video"><input type="hidden" name="token" value="{{ csrf }}"><input name="target" maxlength="{{ web_limits.target_chars }}" placeholder="BV号或B站视频链接" required><button class="btn">提交视频</button></form></div>
+<div class="card"><h2 class="card__title">添加订阅</h2><form class="form-row" method="post" action="/admin/sources" data-async data-reset><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><select name="kind"><option value="bili">B站UP主</option><option value="rss">RSS订阅</option></select><input name="target" maxlength="{{ web_limits.target_chars }}" placeholder="MID、空间链接或RSS地址" required><input name="name" maxlength="{{ web_limits.source_name_chars }}" placeholder="显示名称"><button class="btn">添加来源</button></form></div>
+<div class="card"><h2 class="card__title">处理指定视频</h2><form class="form-row" method="post" action="/admin/video" data-async data-reset><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><input name="target" maxlength="{{ web_limits.target_chars }}" placeholder="BV号或B站视频链接" required><button class="btn">提交视频</button></form></div>
 </div>
 
 <div class="section-head"><h2>订阅来源</h2><span class="meta"><span data-live-region="source-count">共 {{ sources|length }} 个</span> · 拖动 ⋮⋮ 排序</span></div>
 <div class="table-wrap"><table>
 <thead><tr><th>名称</th><th>目标</th><th>状态</th><th>操作</th></tr></thead>
-<tbody data-live-region="sources" id="source-list" data-token="{{ csrf }}">{% for s in sources %}<tr data-source-id="{{ s.id }}"><td><div class="source-identity"><button type="button" class="btn btn--subtle btn--sm source-grip" draggable="true" aria-label="排序 {{ s.name }}，可用上下方向键" style="cursor:grab">⋮⋮</button> <span class="source-name">{{ s.name }}</span><span class="pill pill--muted source-kind">{{ "B站" if s.kind == "bili" else "RSS" }}</span></div></td><td><code>{{ s.target }}</code></td><td>{% if s.enabled %}<span class="pill pill--ok">启用</span>{% else %}<span class="pill pill--muted">暂停</span>{% endif %}<br><small>{{ '上次检查 ' ~ (s.last_poll|ago) if s.last_poll else '尚未检查' }}</small>{% if s.error %}<br><small>最近失败：{{ s.error|error_text }}</small>{% endif %}</td><td><div class="row-actions"><a class="btn btn--subtle btn--sm" href="/admin/sources/{{ s.id }}/edit">编辑</a>{% for action,label in [('refresh','检查更新'),('toggle','启停'),('delete','删除')] %}<form class="inline" method="post" action="/admin/sources/{{ s.id }}/{{ action }}"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--sm {{ 'btn--danger' if action=='delete' else 'btn--subtle' }}">{{ label }}</button></form>{% endfor %}</div></td></tr>{% else %}<tr><td colspan="4">还没有订阅来源。</td></tr>{% endfor %}</tbody>
+<tbody data-live-region="sources" id="source-list" data-token="{{ csrf }}">{% for s in sources %}<tr data-source-id="{{ s.id }}"><td><div class="source-identity"><button type="button" class="btn btn--subtle btn--sm source-grip" draggable="true" aria-label="排序 {{ s.name }}，可用上下方向键" style="cursor:grab">⋮⋮</button> <span class="source-name">{{ s.name }}</span><span class="pill pill--muted source-kind">{{ "B站" if s.kind == "bili" else "RSS" }}</span></div></td><td><code>{{ s.target }}</code></td><td>{% if s.enabled %}<span class="pill pill--ok">启用</span>{% else %}<span class="pill pill--muted">暂停</span>{% endif %}<br><small>{{ '上次检查 ' ~ (s.last_poll|ago) if s.last_poll else '尚未检查' }}</small>{% if s.error %}<br><small>最近失败：{{ s.error|error_text }}</small>{% endif %}</td><td><div class="row-actions"><a class="btn btn--subtle btn--sm" href="/admin/sources/{{ s.id }}/edit">编辑</a>{% for action,label in [('refresh','检查更新'),('toggle','启停'),('delete','删除')] %}<form class="inline" method="post" action="/admin/sources/{{ s.id }}/{{ action }}" data-async><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--sm {{ 'btn--danger' if action=='delete' else 'btn--subtle' }}">{{ label }}</button></form>{% endfor %}</div></td></tr>{% else %}<tr><td colspan="4">还没有订阅来源。</td></tr>{% endfor %}</tbody>
 </table></div>
 
 <p id="source-order-status" class="meta" role="status" aria-live="polite"></p>
 <script src="/static/source-order.js" defer></script>
 
-<div class="section-head"><h2>任务与重建</h2><span class="meta">同一面板切换视图，任务明细与重建记录不再重复列出</span></div>
+<div class="section-head"><h2>任务与重建</h2><span class="meta">重建会在处理完成后自动发布</span></div>
 <div class="card card--flush">
 <div class="toolbar">
-<nav class="segmented" aria-label="任务视图">{% for key,label in [('all','全部任务'),('active','进行中'),('failed','失败'),('done','已完成'),('retracted','已撤回'),('canceled','已取消'),('rebuilds','重建记录')] %}<a class="seg{% if view == key %} seg--current{% endif %}" href="/admin?view={{ key }}{% if day_filter %}&day={{ day_filter }}{% endif %}"{% if view == key %} aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}</nav>
-<form class="form-row form-row--compact" method="get" action="/admin"><input type="hidden" name="view" value="{{ view }}"><input type="date" name="day" value="{{ day_filter }}" aria-label="按日期过滤"><button class="btn btn--subtle btn--sm">按日期过滤</button>{% if day_filter %}<a class="btn btn--subtle btn--sm" href="/admin?view={{ view }}">清除</a>{% endif %}</form>
-<form class="form-row form-row--compact" method="post" action="/admin/rebuild"><input type="hidden" name="token" value="{{ csrf }}"><input type="date" name="day" required aria-label="重建日期"><button class="btn btn--sm">重建该日日报</button></form>
-<form class="form-row form-row--compact" method="post" action="/admin/rebuild/range"><input type="hidden" name="token" value="{{ csrf }}"><select name="days" aria-label="重建最近几天"><option value="1">最近 1 天</option><option value="3">最近 3 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option></select><button class="btn btn--subtle btn--sm">重建</button></form>
+<nav class="segmented" aria-label="任务视图">{% for key,label in [('all','全部任务'),('active','进行中'),('failed','失败'),('done','已完成'),('retracted','已撤回'),('canceled','已取消'),('rebuilds','重建记录')] %}<a class="seg{% if view == key %} seg--current{% endif %}" href="/admin?view={{ key }}{% if day_filter %}&day={{ day_filter }}{% endif %}" data-async-nav{% if view == key %} aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}</nav>
+<form class="form-row form-row--compact" method="get" action="/admin" data-async-nav><input type="hidden" name="view" value="{{ view }}"><input type="date" name="day" value="{{ day_filter }}" aria-label="按日期过滤"><button class="btn btn--subtle btn--sm">按日期过滤</button>{% if day_filter %}<a class="btn btn--subtle btn--sm" href="/admin?view={{ view }}" data-async-nav>清除</a>{% endif %}</form>
+<form class="form-row form-row--compact" method="post" action="/admin/rebuild" data-async><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><input type="date" name="day" required aria-label="重建日期"><button class="btn btn--sm">重建该日</button></form>
+<form class="form-row form-row--compact" method="post" action="/admin/rebuild/range" data-async><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><select name="days" aria-label="重建最近几天"><option value="1">最近 1 天</option><option value="3">最近 3 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option></select><button class="btn btn--subtle btn--sm">重建</button></form>
 </div>
+
+<p id="dashboard-action-status" class="meta" role="status" aria-live="polite"></p>
 
 <div data-live-region="task-panel" id="task-panel">
 {% if view == 'rebuilds' %}
 <div class="table-wrap table-wrap--nested"><table>
 <thead><tr><th>日期</th><th>状态</th><th>进度</th><th>耗时</th><th>说明</th></tr></thead>
-<tbody>{% for job in rebuilds %}<tr><td>{{ job.day }}{% if job.batch %}<br><small class="meta">批次 {{ job.batch }}</small>{% endif %}</td><td><span class="state state--{{ job.state_class }}"><span class="state__dot" aria-hidden="true"></span>{{ job.state_label }}</span></td><td>{% if job.progress is not none %}<div class="progress progress--sm"><div class="progress__bar" style="width:{{ job.progress }}%"></div></div><small>{{ job.done }}/{{ job.total }} 条已完成</small>{% else %}<small>—</small>{% endif %}</td><td><small>{% if job.elapsed %}{{ job.elapsed|duration }}{% else %}—{% endif %}</small></td><td>{% if job.error_text %}<small>{{ job.error_text }}</small>{% else %}<small class="meta">处理完成后自动发布，未成功条目沿用上一版</small>{% endif %}</td></tr>{% else %}<tr><td colspan="5">暂无重建记录。可在上方选择日期提交重建任务。</td></tr>{% endfor %}</tbody>
+<tbody>{% for job in rebuilds %}<tr><td>{{ job.day }}{% if job.batch %}<br><small class="meta">批次 {{ job.batch }}</small>{% endif %}</td><td><span class="state state--{{ job.state_class }}"><span class="state__dot" aria-hidden="true"></span>{{ job.state_label }}</span></td><td>{% if job.progress is not none %}<div class="progress progress--sm"><div class="progress__bar" style="width:{{ job.progress }}%"></div></div><small>{{ job.done }}/{{ job.total }} 条已完成</small>{% else %}<small>—</small>{% endif %}</td><td><small>{% if job.elapsed %}{{ job.elapsed|duration }}{% else %}—{% endif %}</small></td><td>{% if job.error_text %}<small>{{ job.error_text }}</small>{% else %}<small class="meta">未成功条目沿用上一版</small>{% endif %}</td></tr>{% else %}<tr><td colspan="5">暂无重建记录。</td></tr>{% endfor %}</tbody>
 </table></div>
 {% else %}
-<p class="meta toolbar__hint"><span data-live-region="task-count">{{ tasks|length }}</span> 条{% if view == 'all' %}最近任务{% elif view == 'active' %}进行中的任务{% elif view == 'failed' %}处理失败的任务{% elif view == 'canceled' %}因来源删除而取消的任务{% elif view == 'retracted' %}已撤回、未出现在日报中的条目{% else %}已完成的任务{% endif %}{% if day_filter %} · {{ day_filter }}{% endif %}{% if task_counts.failed and view != 'failed' %} · 有 {{ task_counts.failed }} 条失败任务<a href="/admin?view=failed">查看</a>{% endif %}{% if task_counts.canceled and view != 'canceled' %} · 有 {{ task_counts.canceled }} 条已取消任务<a href="/admin?view=canceled">查看</a>{% endif %}{% if task_counts.retracted and view not in ('retracted','done') %} · 有 {{ task_counts.retracted }} 条已撤回<a href="/admin?view=retracted">查看</a>{% endif %}</p>
+<p class="meta toolbar__hint"><span data-live-region="task-count">{{ tasks_total }}</span> 条{% if view == 'all' %}最近任务{% elif view == 'active' %}进行中的任务{% elif view == 'failed' %}处理失败的任务{% elif view == 'canceled' %}因来源删除而取消的任务{% elif view == 'retracted' %}已撤回、未出现在日报中的条目{% else %}已完成的任务{% endif %}{% if day_filter %} · {{ day_filter }}{% endif %}{% if task_counts.failed and view != 'failed' %} · 有 {{ task_counts.failed }} 条失败任务<a href="/admin?view=failed" data-async-nav>查看</a>{% endif %}{% if task_counts.canceled and view != 'canceled' %} · 有 {{ task_counts.canceled }} 条已取消任务<a href="/admin?view=canceled" data-async-nav>查看</a>{% endif %}{% if task_counts.retracted and view not in ('retracted','done') %} · 有 {{ task_counts.retracted }} 条已撤回<a href="/admin?view=retracted" data-async-nav>查看</a>{% endif %}</p>
 <div class="table-wrap table-wrap--nested"><table>
 <thead><tr><th>内容</th><th>状态</th><th>阶段 / 进度</th><th>更新时间</th><th>操作</th></tr></thead>
 <tbody>{% for task in tasks %}<tr>
-<td><small>{{ task.day }} · {{ task.source_name }}</small><br><strong>{{ task.title }}</strong></td>
+<td><small>{{ task.day }} · {{ task.source_name }}</small><br><strong>{{ task.title }}</strong>{% if task.entry_count and task.entry_count > 1 %}<br><small class="meta">已拆为 {{ task.entry_count }} 条日报</small>{% endif %}</td>
 <td><span class="state state--{{ task.state_class }}"><span class="state__dot" aria-hidden="true"></span>{{ task.state_label }}</span><br><small>{{ task.state_note or '尝试 ' ~ task.attempts ~ ' 次' }}</small></td>
 <td>{% if task.stage_text %}<small>{% if task.status == 'running' %}当前阶段{% else %}最近阶段{% endif %}：{{ task.stage_text }}</small>{% endif %}{% if task.error_text %}{% if task.stage_text %}<br>{% endif %}<small class="{{ 'meta' if task.status == 'canceled' else 'text-danger' }}">{{ task.error_text }}</small>{% endif %}{% if task.warning_text %}{% if task.stage_text or task.error_text %}<br>{% endif %}<small>{{ task.warning_text }}</small>{% endif %}{% if not task.stage_text and not task.error_text and not task.warning_text %}<small>—</small>{% endif %}</td>
 <td><small>{{ task.updated|beijing_time }}</small>{% if task.retracted %}<br><small class="meta">已撤回{% if task.retract_reason %}：{{ task.retract_reason }}{% endif %}{% if task.retracted_at %} · {{ task.retracted_at|beijing_time }}{% endif %}</small>{% endif %}</td>
-<td><div class="row-actions">{% if task.status == 'failed' %}{% if task.exhausted %}<small class="meta">已达上限</small>{% else %}<form method="post" action="/admin/tasks/{{ task.id }}/retry"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--sm">重试</button></form>{% endif %}{% elif task.status == 'done' %}{% if task.retracted %}<form method="post" action="/admin/tasks/{{ task.id }}/restore"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--subtle btn--sm">恢复</button></form>{% else %}<a class="btn btn--subtle btn--sm" href="/daily/{{ task.day }}">查看日报</a><form method="post" action="/admin/tasks/{{ task.id }}/retract" onsubmit="return confirm('撤回后该条将从当天日报移除，可随时恢复。确定？')"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--danger btn--sm">撤回</button></form>{% endif %}{% endif %}</div></td>
+<td><div class="row-actions">{% if task.status == 'failed' %}{% if task.exhausted %}<small class="meta">已达上限</small>{% else %}<form method="post" action="/admin/tasks/{{ task.id }}/retry" data-async><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--sm">重试</button></form>{% endif %}{% elif task.status == 'done' %}{% if task.retracted %}<form method="post" action="/admin/tasks/{{ task.id }}/restore" data-async><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--subtle btn--sm">恢复</button></form>{% else %}<a class="btn btn--subtle btn--sm" href="/daily/{{ task.day }}">查看日报</a><form method="post" action="/admin/tasks/{{ task.id }}/retract" data-async onsubmit="return confirm('撤回后该条将从当天日报移除，可随时恢复。确定？')"><input type="hidden" name="view" value="{{ view }}"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--danger btn--sm">撤回</button></form>{% endif %}{% endif %}</div></td>
 </tr>{% else %}<tr><td colspan="5">{% if day_filter %}该日期没有符合条件的任务。{% else %}等待新内容。{% endif %}</td></tr>{% endfor %}</tbody>
 </table></div>
 {% endif %}
+{% if view != 'rebuilds' and tasks_pages > 1 %}<nav class="pager pager--inline" aria-label="任务分页">
+{% if tasks_page > 1 %}<a class="btn btn--subtle btn--sm" href="/admin?view={{ view }}{% if day_filter %}&day={{ day_filter }}{% endif %}&tasks={{ tasks_page - 1 }}">上一页</a>{% else %}<span class="btn btn--subtle btn--sm" aria-disabled="true">上一页</span>{% endif %}
+<span class="meta">第 {{ tasks_page }} / {{ tasks_pages }} 页 · 共 {{ tasks_total }} 条</span>
+{% if tasks_page < tasks_pages %}<a class="btn btn--subtle btn--sm" href="/admin?view={{ view }}{% if day_filter %}&day={{ day_filter }}{% endif %}&tasks={{ tasks_page + 1 }}">下一页</a>{% else %}<span class="btn btn--subtle btn--sm" aria-disabled="true">下一页</span>{% endif %}
+</nav>{% endif %}
 </div>
 </div>
 
-<div class="card"><details class="events"><summary>最近活动（{{ events|length }} 条阶段记录）</summary>
-<ol class="timeline">{% for e in events %}<li><span class="timeline__time">{{ e.created|beijing_time }}</span><span class="timeline__text">#{{ e.task_id }} {{ e.title }}</span><span class="timeline__stage">{{ e.stage|stage_label }}</span><span class="state state--{{ 'ok' if e.status == 'ok' else ('run' if e.status == 'started' else 'danger') }}"><span class="state__dot" aria-hidden="true"></span>{% if e.status == 'ok' %}完成{% elif e.status == 'started' %}开始{% else %}{{ e.status }}{% endif %}</span>{% if e.detail %}<span class="meta">{{ e.detail }}</span>{% endif %}</li>{% else %}<li class="meta">暂无阶段记录。</li>{% endfor %}</ol>
-</details></div>
+<div class="section-head"><h2>阶段记录</h2><span class="meta">共 {{ events_total }} 条 · 第 {{ events_page }}/{{ events_pages }} 页</span></div>
+<div class="card card--flush">
+{% if events %}<ol class="runlog">{% for group in events %}<li class="runlog__item">
+<details class="runlog__group">
+<summary class="runlog__head">
+<span class="state state--{{ group.state }}"><span class="state__dot" aria-hidden="true"></span>{{ group.state_label }}</span>
+<span class="runlog__title">{% if group.task_id %}#{{ group.task_id }} {% endif %}{{ group.title or '（任务已删除）' }}</span>
+<span class="runlog__time">{{ group.latest|beijing_time }}</span>
+<span class="chev" aria-hidden="true"></span>
+</summary>
+<ol class="runlog__stages">{% for stage in group.stages %}<li><span class="runlog__stage">{{ stage.label }}</span><span class="state state--{{ stage.state }}"><span class="state__dot" aria-hidden="true"></span>{% if stage.state == 'ok' %}完成{% elif stage.state == 'run' %}进行中{% else %}失败{% endif %}</span>{% if stage.detail %}<span class="meta">{{ stage.detail }}</span>{% endif %}<span class="runlog__time">{{ stage.at|beijing_time }}</span></li>{% endfor %}</ol>
+</details>
+</li>{% endfor %}</ol>
+{% else %}<p class="meta">暂无阶段记录。</p>{% endif %}
+{% if events_pages > 1 %}<nav class="pager pager--inline" aria-label="阶段记录分页">
+{% if events_page > 1 %}<a class="btn btn--subtle btn--sm" href="/admin?view={{ view }}{% if day_filter %}&day={{ day_filter }}{% endif %}&events={{ events_page - 1 }}">上一页</a>{% else %}<span class="btn btn--subtle btn--sm" aria-disabled="true">上一页</span>{% endif %}
+<span class="meta">第 {{ events_page }} / {{ events_pages }} 页</span>
+{% if events_page < events_pages %}<a class="btn btn--subtle btn--sm" href="/admin?view={{ view }}{% if day_filter %}&day={{ day_filter }}{% endif %}&events={{ events_page + 1 }}">下一页</a>{% else %}<span class="btn btn--subtle btn--sm" aria-disabled="true">下一页</span>{% endif %}
+</nav>{% endif %}
+</div>
 
 <div class="form-actions"><form method="post" action="/admin/logout"><input type="hidden" name="token" value="{{ csrf }}"><button class="btn btn--subtle">退出登录</button></form></div>
 <script src="/static/admin-refresh.js" defer></script>

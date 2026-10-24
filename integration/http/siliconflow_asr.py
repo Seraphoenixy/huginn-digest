@@ -1,15 +1,16 @@
 """硅基流动音频上传；错误不回显响应正文、请求头或密钥。"""
 import time
 import requests
+from config import DEFAULT_ASR_ENDPOINT
 
 
-def transcribe_audio(path, *, api_key, model, timeout):
+def transcribe_audio(path, *, api_key, model, timeout, endpoint=DEFAULT_ASR_ENDPOINT):
     for attempt in range(3):
         response = None
         try:
             with open(path, 'rb') as audio:
                 response = requests.post(
-                    'https://api.siliconflow.cn/v1/audio/transcriptions',
+                    endpoint,
                     headers={'Authorization': 'Bearer ' + api_key},
                     data={'model': model}, files={'file': ('audio.wav', audio, 'audio/wav')},
                     allow_redirects=False, timeout=(30, timeout))

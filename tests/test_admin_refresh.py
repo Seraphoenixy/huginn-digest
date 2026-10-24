@@ -182,13 +182,13 @@ class ModelReloadTests(unittest.TestCase):
         self.assertTrue(self.service.refresh_config())
         self.assertEqual(self.service.settings.get('llm','model'),'fixture-model-next')
 
-    def test_config_page_never_exposes_key_or_full_url(self):
+    def test_config_page_never_exposes_key_but_shows_endpoint(self):
         self.rewrite('[llm]\napi_key = ""','[llm]\napi_key = "private-key-fixture"')
         self.service.settings.refresh_llm(force=True)
         page=self.client.get('/admin').text
+        # 密钥任何形态都不出现；接口地址与模型名按要求完整回显给已登录管理员。
         self.assertNotIn('private-key-fixture',page)
-        self.assertNotIn('/api/plan/v3',page)
-        self.assertIn('ark.cn-beijing.volces.com',page)
+        self.assertIn('https://ark.cn-beijing.volces.com/api/plan/v3',page)
 
 
 if __name__=='__main__':unittest.main()

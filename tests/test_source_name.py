@@ -31,14 +31,14 @@ class SourceNameSnapshotTests(unittest.TestCase):
         task=self.service.store.query('SELECT * FROM tasks WHERE url=?',(url,))[0]
         folder=self.service.settings.content_dir/str(task['id'])
         write_text(folder/'raw.txt','正文')
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':list(bullets)}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':list(bullets)}))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
         return task
 
     def regenerate(self,task,bullets=('新要点',)):
         """模拟重建后摘要重新生成，触发该日重新发布。"""
         folder=self.service.settings.content_dir/str(task['id'])
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':list(bullets)}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':list(bullets)}))
 
     def test_deleted_source_keeps_name_after_republish(self):
         """回归：删除来源后重新发布，历史条目曾降级为“已删除的订阅来源”。"""

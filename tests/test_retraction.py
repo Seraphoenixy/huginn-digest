@@ -30,7 +30,7 @@ class RetractionTests(unittest.TestCase):
         self.service.enqueue('rss',{'url':url,'title':title,'published':time.time()})
         task=self.service.store.query('SELECT * FROM tasks WHERE url=?',(url,))[0]
         folder=self.settings.content_dir/str(task['id'])
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':list(bullets)}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':list(bullets)}))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
         return task
 
@@ -159,7 +159,7 @@ class RetractionRouteTests(unittest.TestCase):
         self.service.enqueue('rss',{'url':'https://example.com/a','title':'文章','published':time.time()})
         task=self.service.store.query('SELECT * FROM tasks')[0]
         folder=self.settings.content_dir/str(task['id'])
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']}))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
         self.task_id=task['id']
         self.day=task['day']
@@ -224,7 +224,7 @@ class ArchiveDeadLinkTests(unittest.TestCase):
         self.service.enqueue('rss',{'url':'https://example.com/a','title':'文章','published':time.time()})
         task=self.service.store.query('SELECT * FROM tasks')[0]
         folder=self.settings.content_dir/str(task['id'])
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']}))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
         self.service.publish(self.day)
 

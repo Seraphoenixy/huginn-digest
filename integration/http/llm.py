@@ -9,7 +9,11 @@ class CloudError(RuntimeError):
 def complete(settings, messages, *, json_mode=False):
     if not settings.llm_key:
         raise CloudError('缺少 LLM_BRAIN_API_KEY')
-    body = {'model': settings.get('llm', 'model'), 'messages': messages, 'temperature': 0, 'max_tokens': 8000}
+    # 单次输出上限走配置（默认 32000）。实测“思考 token”会先占掉这份额度
+    # （纠错单次最高约 17000），额度不足时接口返回空内容而 finish_reason 仍是
+    # stop，只能靠“内容为空”识别，所以必须留足余量。
+    body = {'model': settings.get('llm', 'model'), 'messages': messages, 'temperature': 0,
+            'max_tokens': settings.get('llm', 'max_tokens', 32000)}
     if settings.get('llm', 'thinking_disabled', True):
         body['thinking'] = {'type': 'disabled'}
     if json_mode:
@@ -27,10 +31,20 @@ def complete(settings, messages, *, json_mode=False):
                         continue
                 if response.status_code != 200:
                     raise CloudError(f'LLM HTTP {response.status_code}')
-                choice = response.json()['choices'][0]
+                payload = response.json()
+                choice = payload['choices'][0]
                 text = choice['message'].get('content') or ''
-                if choice.get('finish_reason') != 'stop' or not text.strip():
-                    raise CloudError('LLM输出为空或未完整结束')
+                finish = choice.get('finish_reason')
+                if finish != 'stop':
+                    # 截断是结构性错误，重试同样的请求只会同样被截断。
+                    raise CloudError('LLM输出被截断')
+                if not text.strip():
+                    # 空正文常见于思考 token 吃满配额：同一请求重试通常能出结果，
+                    # 所以按可重试处理，而不是直接放弃这一段。
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise CloudError('LLM输出为空')
                 return text
         except requests.RequestException:
             if attempt == 2:

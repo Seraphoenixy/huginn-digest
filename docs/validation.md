@@ -4,7 +4,7 @@
 
 ## 离线验证
 
-Windows / Python 3.13项目虚拟环境更新运行、测试和构建依赖后，使用无凭据示例配置通过DAILY_CONFIG执行 `python -m unittest discover -s tests -v`，331项通过；`python -m pip check`通过，未调用真实API或加载模型。当前实测包括certifi2026.10.19、AnyIO4.15.1、FastAPI0.159.1、yt-dlp2026.10.21、PyInstaller6.22.3及hooks2026.9。测试数量以实际发现为准。
+Windows / Python 3.13项目虚拟环境，使用无凭据示例配置（`cp config.example.toml config.toml`）执行 `python -m unittest discover -s tests`，354项通过；`python -m pip check`通过，未调用真实API或加载模型。当前实测包括certifi2026.10.19、AnyIO4.15.1、FastAPI0.159.1、yt-dlp2026.10.21、PyInstaller6.22.3及hooks2026.9。测试数量以实际发现为准。
 
 certifi维护者公告将2026.10.18列为移除受影响emSign根证书的修复版本，与此前漏洞库给出的2026.10.19边界不一致；不能据版本号认定2026.10.18仍受该问题影响。当前依赖下限采用更新的2026.10.19；来源见[维护者公告](https://github.com/certifi/python-certifi/security/advisories/GHSA-6q48-6c7w-9gw2)。
 
@@ -73,7 +73,7 @@ certifi维护者公告将2026.10.18列为移除受影响emSign根证书的修复
 
 - 两条指定视频完成独立下载、星辰ASR V3.2、DeepSeek V4.1 Flash纠错、JSON摘要和发布，均成功且无纠错降级，未扫描订阅账号。原始证据在未提交的 `data/live_validation/`；精确运行时版本与权重指纹未记录。
 - 三份摘要修正后重新生成并发布，对照输入未发现独立主题遗漏或跨主题错误合并；仍有转写专名疑点及摘要偏长问题，未对照音频或核验新闻事实。
-- 公开日报页经Chrome无头渲染核对：桌面1400px、窄屏512px（触发≤640规则）与404页均无横向溢出（512px时scrollWidth497），正文在窄屏先于归档，分节与翻页按预期排布；证据为 `data/daily-page-desktop.png`、`data/daily-page-mobile.png`、`data/daily-page-404.png`，均为临时目录夹具（9条/5主题、手写模型标题）渲染，不含真实来源数据；标题文本不是模型真实输出。本地导航入口及health集成检查通过，未发布线上导航变更。
+- 公开日报页经Chrome无头渲染核对：桌面1400px、窄屏512px（触发≤640规则）与404页均无横向溢出（512px时scrollWidth497），正文在窄屏先于归档，分节与翻页按预期排布；证据为当时的无头截图（不入库，避免把渲染产物混进代码库与数据目录）；渲染用的是临时目录夹具（9条/5主题、手写模型标题）渲染，不含真实来源数据；标题文本不是模型真实输出。本地导航入口及health集成检查通过，未发布线上导航变更。
 - 一次Cookie登录检查返回HTTP 200 / code=-101 / isLogin=false，只证明该次凭据失效，更新凭据后需复验。
 
 - 单条授权视频（331秒）的基线两次纠错输出完全一致，未见复核增益。最新实测使用用户确认、仅绑定该视频的五项术语，复用2294字原始ASR后调用一次DeepSeek V4.1 Flash（5.6秒）；Space Bunny、TRAE、Ming-3.0、Xing4.0-29B-Intent及GPT-Image-2.5 Sunburst均正确出现在最终稿，数字与术语检查通过，纠错清单完成且原稿不变，未发布。这证明已确认术语可修复该样本，不证明模型能够自行识别这些名称。证据在未提交的 `data/correction_validation/`。

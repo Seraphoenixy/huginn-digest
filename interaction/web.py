@@ -14,6 +14,8 @@ from orchestration.service import DailyService
 from orchestration.status import duration_text, explain_error, rebuild_label, stage_label, status_label
 
 TASK_VIEWS={'all','active','failed','done','canceled','retracted'}
+# “重建记录”与任务视图共用同一面板，所以它也是合法视图：漏掉它会被折叠成“全部任务”。
+PAGE_VIEWS=TASK_VIEWS|{'rebuilds'}
 
 def create_app(settings=None, *, run_background=True):
     settings=settings or Settings()
@@ -65,7 +67,7 @@ def create_app(settings=None, *, run_background=True):
         authenticated=bool(service.session(request.cookies.get('daily_session')).get('admin'))
         public_url=settings.site_public_url.rstrip('/')
         canonical=(public_url+request.url.path) if public_url else ''
-        return templates.TemplateResponse(request=request,name=name,context={'site':settings.site_name,'nav_url':settings.site_nav_url,'canonical_url':canonical,'page_title':settings.site_name,'description':'','og_type':'website','request':request,'authenticated':authenticated,'web_limits':limits,**values})
+        return templates.TemplateResponse(request=request,name=name,context={'site':settings.site_name,'canonical_url':canonical,'page_title':settings.site_name,'description':'','og_type':'website','request':request,'authenticated':authenticated,'web_limits':limits,**values})
 
     def describe(report):
         """分享用的摘要：只取标题，不含正文与任何凭据。"""
@@ -92,6 +94,11 @@ def create_app(settings=None, *, run_background=True):
     def csrf(request,value,require_admin=True):
         session=admin(request) if require_admin else service.session(request.cookies.get('daily_session'))
         if not value or not hmac.compare_digest(session.get('csrf',''),value):raise HTTPException(403,'表单已过期，请刷新后重试')
+
+    def back(view,fallback):
+        """操作完成后回到用户当前视图，避免视图被服务端默认值改写。"""
+        target=view if view in PAGE_VIEWS else fallback
+        return RedirectResponse(f'/admin?view={target}' if target!='all' else '/admin',status_code=303)
 
     def cookie(response,token):
         # 删除旧版窄路径Cookie，避免同名Cookie相互遮蔽。
@@ -175,15 +182,15 @@ def create_app(settings=None, *, run_background=True):
         return cookie(RedirectResponse('/admin',status_code=303),service.new_session(True))
 
     @app.get('/admin')
-    def dashboard(request:Request,view:str='all',day:str=''):
+    def dashboard(request:Request,view:str='all',day:str='',events:int=1,tasks:int=1):
         session=admin(request)
-        view=view if view in TASK_VIEWS else 'all'
+        view=view if view in PAGE_VIEWS else 'all'
         day=day.strip()
         if day:
             try:day=datetime.strptime(day,'%Y-%m-%d').date().isoformat()
             except ValueError:raise HTTPException(400,'日期格式应为 YYYY-MM-DD') from None
         return render(request,'admin.html',csrf=session['csrf'],admin_refresh_seconds=settings.admin_refresh_seconds,
-                      **service.dashboard(view,day or None))
+                      **service.dashboard(view,day or None,events,tasks))
 
     @app.get('/admin/status')
     def admin_status(request:Request):
@@ -192,22 +199,45 @@ def create_app(settings=None, *, run_background=True):
         return JSONResponse(service.activity_status(),headers={'Cache-Control':'no-store'})
 
     @app.post('/admin/config/reload')
-    def reload_config(request:Request,token:str=Form(max_length=limits['csrf_token_chars'])):
+    def reload_config(request:Request,view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         csrf(request,token)
         changed,state,deferred=service.reload_model_config()
         if not changed and state['error']:
             raise HTTPException(409,f'配置未生效：{state["error"]}；仍使用上一版')
         # 处理中只登记待应用，不做半途切换；页面通过 llm.pending 显示。
-        return RedirectResponse('/admin',status_code=303)
+        return back(view,'all')
+
+    @app.post('/admin/config/models')
+    def save_models(request:Request,
+                    llm_base_url:str=Form('',max_length=limits['target_chars']),
+                    llm_model:str=Form('',max_length=limits['source_name_chars']),
+                    llm_key:str=Form('',max_length=limits['target_chars']),
+                    asr_model:str=Form('',max_length=limits['source_name_chars']),
+                    asr_base_url:str=Form('',max_length=limits['target_chars']),
+                    asr_key:str=Form('',max_length=limits['target_chars']),
+                    view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
+        """保存模型与密钥：只写 config.toml，密钥既不回显也不进入任务库与日志。"""
+        csrf(request,token)
+        try:
+            result=service.configure_models(llm_key=llm_key,llm_base_url=llm_base_url,llm_model=llm_model,
+                                            asr_key=asr_key,asr_model=asr_model,asr_base_url=asr_base_url)
+        except ValueError as exc:
+            raise HTTPException(400,str(exc)) from None
+        except Exception:
+            raise HTTPException(400,'模型配置保存失败，原配置保留') from None
+        state=result['llm']
+        if result['llm_saved'] and state.get('error') and not state.get('pending'):
+            raise HTTPException(409,f'已保存但未生效：{state["error"]}；仍使用上一版')
+        return back(view,'all')
 
     @app.post('/admin/cleanup')
-    def cleanup_now(request:Request,token:str=Form(max_length=limits['csrf_token_chars'])):
+    def cleanup_now(request:Request,view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         """手动执行一次空间清理；与定时任务共用同一实现。"""
         csrf(request,token)
         result=service.run_cleanup()
         if result is None:
             raise HTTPException(409,'清理未完成，请查看服务日志；已有内容未受影响')
-        return RedirectResponse('/admin',status_code=303)
+        return back(view,'all')
 
     @app.post('/admin/logout')
     def logout(request:Request,token:str=Form(max_length=limits['csrf_token_chars'])):
@@ -219,11 +249,11 @@ def create_app(settings=None, *, run_background=True):
         return response
 
     @app.post('/admin/sources')
-    def add_source(request:Request,kind:str=Form(max_length=limits['source_kind_chars']),target:str=Form(max_length=limits['target_chars']),name:str=Form('',max_length=limits['source_name_chars']),token:str=Form(max_length=limits['csrf_token_chars'])):
+    def add_source(request:Request,kind:str=Form(max_length=limits['source_kind_chars']),target:str=Form(max_length=limits['target_chars']),name:str=Form('',max_length=limits['source_name_chars']),view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         csrf(request,token)
         try:service.add_source(kind,target,name)
         except Exception:raise HTTPException(400,'来源无效或已存在，请检查公开地址或MID') from None
-        return RedirectResponse('/admin',status_code=303)
+        return back(view,'all')
 
     @app.get('/admin/sources/{source_id}/edit')
     def edit_source_page(request:Request,source_id:int):
@@ -249,43 +279,43 @@ def create_app(settings=None, *, run_background=True):
         return RedirectResponse('/admin',status_code=303)
 
     @app.post('/admin/sources/{source_id}/{action}')
-    def source_action(request:Request,source_id:int,action:str,token:str=Form(max_length=limits['csrf_token_chars'])):
+    def source_action(request:Request,source_id:int,action:str,view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         csrf(request,token)
         try:service.source_action(source_id,action)
         except ValueError:raise HTTPException(400,'未知操作') from None
-        return RedirectResponse('/admin',status_code=303)
+        return back(view,'all')
 
     @app.post('/admin/video')
-    def video(request:Request,target:str=Form(max_length=limits['target_chars']),token:str=Form(max_length=limits['csrf_token_chars'])):
+    def video(request:Request,target:str=Form(max_length=limits['target_chars']),view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         csrf(request,token)
         try:service.submit_video(target)
         except Exception:raise HTTPException(400,'视频提交失败，请检查BV号、Cookie或网络') from None
-        return RedirectResponse('/admin',status_code=303)
+        return back(view,'all')
 
     @app.post('/admin/tasks/{task_id}/retry')
-    def retry(request:Request,task_id:int,token:str=Form(max_length=limits['csrf_token_chars'])):
+    def retry(request:Request,task_id:int,view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         csrf(request,token)
         try:service.retry(task_id)
         except ValueError as exc:raise HTTPException(409,str(exc)) from None
-        return RedirectResponse('/admin',status_code=303)
+        return back(view,'all')
 
     @app.post('/admin/tasks/{task_id}/retract')
-    def retract(request:Request,task_id:int,reason:str=Form('',max_length=limits['source_name_chars']),token:str=Form(max_length=limits['csrf_token_chars'])):
+    def retract(request:Request,task_id:int,reason:str=Form('',max_length=limits['source_name_chars']),view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         """撤回/恢复已发布条目：与其他写操作共用管理员会话与CSRF校验。"""
         csrf(request,token)
         try:service.retract_entry(task_id,reason)
         except ValueError as exc:raise HTTPException(409,str(exc)) from None
-        return RedirectResponse('/admin?view=done',status_code=303)
+        return back(view,'done')
 
     @app.post('/admin/tasks/{task_id}/restore')
-    def restore(request:Request,task_id:int,token:str=Form(max_length=limits['csrf_token_chars'])):
+    def restore(request:Request,task_id:int,view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         csrf(request,token)
         try:service.restore_entry(task_id)
         except ValueError as exc:raise HTTPException(409,str(exc)) from None
-        return RedirectResponse('/admin?view=retracted',status_code=303)
+        return back(view,'retracted')
 
     @app.post('/admin/rebuild/range')
-    def rebuild_range(request:Request,days:str=Form(max_length=4),token:str=Form(max_length=limits['csrf_token_chars'])):
+    def rebuild_range(request:Request,days:str=Form(max_length=4),view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         """重建最近 N 天；按日展开入队，复用既有每日重建流程。"""
         csrf(request,token)
         try:
@@ -298,14 +328,14 @@ def create_app(settings=None, *, run_background=True):
             raise HTTPException(400,str(exc)) from None
         if not queued:
             raise HTTPException(409,'该区间没有可重建的内容，或这些日期已在队列中')
-        return RedirectResponse('/admin?view=rebuilds',status_code=303)
+        return back(view,'rebuilds')
 
     @app.post('/admin/rebuild')
-    def rebuild(request:Request,day:str=Form(max_length=limits['day_chars']),token:str=Form(max_length=limits['csrf_token_chars'])):
+    def rebuild(request:Request,day:str=Form(max_length=limits['day_chars']),view:str=Form(''),token:str=Form(max_length=limits['csrf_token_chars'])):
         csrf(request,token)
         try:queued=service.request_rebuild(day)
         except Exception:raise HTTPException(400,'日期无效或重建请求提交失败，既有日报保留') from None
         if not queued:
             raise HTTPException(409,'该日期已有排队或进行中的重建任务，请等待完成')
-        return RedirectResponse('/admin',status_code=303)
+        return back(view,'all')
     return app

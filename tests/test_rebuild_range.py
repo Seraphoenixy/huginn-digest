@@ -35,7 +35,7 @@ class RangeRebuildTests(unittest.TestCase):
         self.service.store.execute('UPDATE tasks SET day=? WHERE id=?',(day,task['id']))
         folder=self.settings.content_dir/str(task['id'])
         write_text(folder/'raw.txt','正文内容')
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']},ensure_ascii=False))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']},ensure_ascii=False))
         write_text(folder/'summary_manifest.json',
                    json.dumps({'fingerprint':self.pipeline.summary_fingerprint(folder/'raw.txt')}))
         self.service.store.update(task['id'],status='done',
@@ -175,7 +175,7 @@ class RangeRebuildRouteTests(unittest.TestCase):
         task=self.service.store.query('SELECT * FROM tasks')[0]
         folder=self.settings.content_dir/str(task['id'])
         write_text(folder/'raw.txt','正文')
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['b']}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['b']}))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'),
                                   raw_path=str(folder/'raw.txt'))
         self.service.publish(day)

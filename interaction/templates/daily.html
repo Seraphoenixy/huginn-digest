@@ -1,12 +1,12 @@
 {% extends 'base.html' %}{% block content %}
 <div class="layout">
 <div class="layout__main">
-<section class="hero"><span class="eyebrow">DAILY BRIEFING / 信息有序，阅读从容</span><h1>{% if report %}{{ report.day }}<br>值得关注的事{% else %}你的每日资讯，<br>正在这里汇集。{% endif %}</h1>
-{% if report %}<p class="meta"><span class="pill{{ '' if report.final else ' pill--muted' }}">{{ '已定稿' if report.final else '持续更新' }}</span>{% if report.supplement %}<span class="pill pill--muted">定稿后补充更新</span>{% endif %} · 最近更新 {{ report.updated|beijing_time }} · 标题可展开完整要点{% if latest and report.day != latest %} <a class="chip chip--accent" href="/">回到最新 {{ latest }}</a>{% endif %}{% if report.day == latest and latest < today %} <span class="chip chip--muted">今日尚未更新，以下为最近一期</span>{% if authenticated %} <a class="chip" href="/admin">去管理页</a>{% endif %}{% endif %}</p>{% else %}<p class="meta">从指定来源获取信息，保留来源，让重要内容更容易抵达。</p>{% endif %}</section>
+<section class="hero"><span class="eyebrow">DAILY BRIEFING</span><h1>{% if report %}{{ report.day }}{% else %}你的每日资讯，<br>正在这里汇集。{% endif %}</h1>
+{% if report %}<p class="meta"><span class="pill{{ '' if report.final else ' pill--muted' }}">{{ '已定稿' if report.final else '持续更新' }}</span>{% if report.supplement %}<span class="pill pill--muted">定稿后补充更新</span>{% endif %} · 最近更新 {{ report.updated|beijing_time }}{% if latest and report.day != latest %} <a class="chip chip--accent" href="/">回到最新 {{ latest }}</a>{% endif %}{% if report.day == latest and latest < today %} <span class="chip chip--muted">今日尚未更新，以下为最近一期</span>{% if authenticated %} <a class="chip" href="/admin">去管理页</a>{% endif %}{% endif %}</p>{% endif %}</section>
 {% if report %}{% if sections|length > 1 %}<nav class="topic-nav" aria-label="主题导航">{% for section in sections %}<a class="chip" href="#topic-{{ section.topic }}">{{ section.topic }}<span class="topic-nav__count">{{ section.entries|length }}</span></a>{% endfor %}</nav>{% endif %}
 {% for section in sections %}<section class="topic" id="topic-{{ section.topic }}">
 <div class="section-head"><h2>{{ section.topic }}</h2><span class="meta">{{ section.entries|length }} 条</span></div>
-{% for entry in section.entries %}<details class="entry" id="entry-{{ entry.id }}"><summary class="entry__head"><div class="entry__heading"><h3>{{ entry.title }}</h3>{% if entry.bullets %}<p class="entry__preview">{{ entry.bullets[0] }}</p>{% endif %}<p class="entry__source">来源：{{ entry.source_name }}{% if entry.published %} · {{ entry.published|beijing_time }}{% endif %}</p></div><span class="entry__count">{{ entry.bullets|length }} 条要点</span><span class="chev" aria-hidden="true"></span></summary><div class="entry__body"><ul>{% for bullet in entry.bullets %}<li>{{ bullet }}</li>{% endfor %}</ul><div class="entry__foot"><a class="source" href="{{ entry.url }}" target="_blank" rel="noopener noreferrer">查看原文 ↗</a><a class="permalink" href="#entry-{{ entry.id }}" aria-label="本条链接">¶</a></div></div></details>{% endfor %}
+{% for group in section.groups %}{% if group.size > 1 %}<div class="same-event"><p class="same-event__label">{{ group.label }}，并列展示，未合并内容</p>{% endif %}{% for entry in group.entries %}<details class="entry" id="entry-{{ entry.id }}"><summary class="entry__head"><div class="entry__heading"><h3>{{ entry.title }}</h3>{% if entry.bullets %}<p class="entry__preview">{{ entry.bullets[0] }}</p>{% endif %}<p class="entry__source">来源：{{ entry.source_name }}{% if entry.published %} · {{ entry.published|beijing_time }}{% endif %}</p></div><span class="entry__count">{{ entry.bullets|length }} 条要点</span><span class="chev" aria-hidden="true"></span></summary><div class="entry__body"><ul>{% for bullet in entry.bullets %}<li>{{ bullet }}</li>{% endfor %}</ul><div class="entry__foot"><a class="source" href="{{ entry.url }}" target="_blank" rel="noopener noreferrer">查看原文 ↗</a><a class="permalink" href="#entry-{{ entry.id }}" aria-label="本条链接">¶</a></div></div></details>{% endfor %}{% if group.size > 1 %}</div>{% endif %}{% endfor %}
 </section>{% endfor %}
 <nav class="pager" aria-label="日期翻页">
 {% if neighbors.prev %}<a class="pager__link" href="/daily/{{ neighbors.prev }}" rel="prev"><span class="pager__dir">← 前一日</span><span class="pager__day">{{ neighbors.prev }}</span></a>{% else %}<span class="pager__link pager__link--none"><span class="pager__dir">← 前一日</span><span class="pager__day">这是第一份日报</span></span>{% endif %}
@@ -39,7 +39,6 @@
 </details>
 </nav>
 <aside class="layout__info"><div class="card info-card"><h2 class="card__title">本日速览</h2>
-{% if report %}<p class="meta">{{ report.day }} · {{ '已定稿' if report.final else '持续更新中' }}</p>{% endif %}
 <dl class="info-list">
 <div><dt>收录条数</dt><dd>{% if report %}{{ stats.entries }} 条{% else %}—{% endif %}</dd></div>
 <div><dt>来源数</dt><dd>{% if report %}{{ stats.sources }} 个{% else %}—{% endif %}</dd></div>
@@ -47,7 +46,6 @@
 <div><dt>内容时段</dt><dd>{% if stats.first and stats.last %}{{ stats.first|beijing_time }}{% if stats.first != stats.last %} → {{ stats.last|beijing_time }}{% endif %}{% else %}—{% endif %}</dd></div>
 <div><dt>归档天数</dt><dd>{{ stats.archive_days }} 天</dd></div>
 </dl>
-{% if sections %}<div class="topic-nav topic-nav--aside">{% for section in sections %}<a class="chip" href="#topic-{{ section.topic }}">{{ section.topic }}<span class="topic-nav__count">{{ section.entries|length }}</span></a>{% endfor %}</div>{% endif %}
 </div></aside>
 </div>
 {% endblock %}

@@ -21,7 +21,7 @@ class RebuildTests(unittest.TestCase):
         self.service.enqueue('rss',{'url':'https://example.com/item','title':'test','published':time.time()})
         task=self.service.store.claim()
         path=self.settings.content_dir/str(task['id'])/'summary.json'
-        write_text(path,json.dumps({'topic':'技术','bullets':['test']}))
+        write_text(path,json.dumps({'topic':'AI 与大模型','bullets':['test']}))
         write_text(path.parent/'raw.txt','测试正文')
         from orchestration.pipeline import ContentPipeline
         pipeline=ContentPipeline(self.settings,self.service.store)
@@ -72,7 +72,7 @@ class RebuildTests(unittest.TestCase):
         task=self.service.store.query('SELECT * FROM tasks')[0]
         Path(task['summary_path']).unlink()
         pipeline=ContentPipeline(self.settings,self.service.store)
-        pipeline.llm.call=Mock(return_value=json.dumps({'topic':'技术','title':'修复后标题','bullets':['修复后的摘要']}))
+        pipeline.llm.call=Mock(return_value=json.dumps({'events':[{'topic':'AI 与大模型','title':'修复后标题','bullets':['修复后的摘要']}]},ensure_ascii=False))
         self.service.pipeline=pipeline
         self.service.request_rebuild(self.day)
         self.service.process_rebuild()
@@ -89,7 +89,7 @@ class RebuildTests(unittest.TestCase):
         folder=Path(task['summary_path']).parent
         (folder/'raw.txt').unlink()
         pipeline=ContentPipeline(self.settings,self.service.store)
-        pipeline.llm.call=Mock(return_value=json.dumps({'topic':'技术','title':'更新后标题','bullets':['更新后的摘要']}))
+        pipeline.llm.call=Mock(return_value=json.dumps({'topic':'AI 与大模型','title':'更新后标题','bullets':['更新后的摘要']}))
         self.service.pipeline=pipeline
         self.service.request_rebuild(self.day)
         with patch('orchestration.pipeline.extract',return_value=('重新获取正文','')) as extract:

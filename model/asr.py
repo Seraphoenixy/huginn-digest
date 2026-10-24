@@ -18,7 +18,8 @@ class CloudASR:
                 number=len(texts)+1
                 started=time.perf_counter()
                 log(f'ASR：开始上传第 {number} 个音频分片，等待云端识别')
-                texts.append(transcribe_audio(chunk, api_key=s.asr_key, model=s.get('asr', 'model'), timeout=s.get('asr', 'timeout', 300)))
+                texts.append(transcribe_audio(chunk, api_key=s.asr_key, model=s.get('asr', 'model'),
+                                              timeout=s.get('asr', 'timeout', 300), endpoint=s.asr_base_url))
                 log(f'ASR：第 {number} 个分片完成，返回 {len(texts[-1])} 字，耗时 {time.perf_counter()-started:.1f} 秒')
         text = '\n'.join(texts)
         if not text.strip():

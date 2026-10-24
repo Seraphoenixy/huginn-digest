@@ -35,8 +35,8 @@ class TranscriptCleanupTests(unittest.TestCase):
         folder=self.settings.content_dir/str(task['id'])
         for name in ('raw.txt','corrected.txt','feed.txt','part_1.txt','correction_0.txt','correction_manifest.json'):
             write_text(folder/name,'正文')
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']}))
-        write_text(folder/'summary_part_0.json',json.dumps({'topic':'技术','bullets':['要点']}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']}))
+        write_text(folder/'summary_part_0.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']}))
         self.service.store.update(task['id'],status='done',
                                   raw_path=str(folder/'raw.txt'),
                                   corrected_path=str(folder/'corrected.txt'),
@@ -79,7 +79,7 @@ class TranscriptCleanupTests(unittest.TestCase):
         task=service.store.query('SELECT * FROM tasks')[0]
         folder=settings.content_dir/str(task['id'])
         write_text(folder/'raw.txt','正文')
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']}))
         service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
         stamp=time.time()-999*86400
         for path in folder.iterdir():

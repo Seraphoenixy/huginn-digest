@@ -17,9 +17,27 @@ day_chars = 10
 
 [site]
 name = "鸦闻 · 每日简报"
-# 留空则不输出canonical链接与导航入口；填写时必须是无内嵌凭据的HTTP(S)地址。
+# 留空则不输出canonical链接；填写时必须是无内嵌凭据的HTTP(S)地址。
 public_url = "https://daily.example.com"
-nav_url = "https://nav.example.com"
+# 日报主题分节：顺序即展示顺序，模型只能从这些词里选，未命中归“其他”。
+# “其他”由程序固定追加在末位，不要写进这个列表。
+# 覆盖 AI、开源、时事、娱乐等多条内容线；按需增删，改动后重建才会重新分类。
+[topics]
+order = [
+  "AI 与大模型",
+  "开发与开源",
+  "产品与应用",
+  "行业与公司",
+  "政策与监管",
+  "安全与隐私",
+  "时事",
+  "游戏",
+  "动漫",
+  "影视",
+  "科技硬件",
+  "研究",
+]
+
 [pipeline]
 poll_seconds = 3600
 lookback_hours = 24
@@ -38,6 +56,8 @@ min_length_ratio = 0.75
 [asr]
 api_key = ""
 model = "XingChenAGI/XingChenASR-V3.2"
+# 转写接口地址，需兼容 OpenAI 转写协议的 HTTPS 端点；留空使用默认的硅基流动地址。
+base_url = ""
 # 其他：XingChenAGI/XingChenASR-V3.2-Ultra、XingChenAGI/XingChenGSR-V1.0、FunAudioLLM/SenseVoiceSmall
 segment_seconds = 600
 timeout = 300
@@ -46,6 +66,8 @@ api_key = ""
 base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
 model = "deepseek-v4.1-flash"
 timeout = 120
+# 单次输出上限。思考 token 会先占用这份额度，额度不足会返回空内容。
+max_tokens = 32000
 thinking_disabled = true
 chunk_chars = 12000
 # 本段支持运行中热加载：保存后后台在任务间隙自动应用，也可在管理页手动重新读取。

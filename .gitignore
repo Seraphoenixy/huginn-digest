@@ -27,3 +27,6 @@ config.*.toml
 *.key
 *.p12
 *.pfx
+
+# 本地临时探针脚本，不属于产品代码
+tmp_*.py

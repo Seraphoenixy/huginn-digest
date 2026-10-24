@@ -8,17 +8,36 @@ STAGE_LABELS={'acquire':'获取正文','correct':'校对转写','summarize':'生
               'check':'核对产物','process':'补齐内容','publish':'发布日报',
               # 清理与撤回不是流水线阶段，只出现在活动状态或事件时间线里。
               'cleanup':'清理存储','retract':'撤回条目'}
-# 主题的唯一权威顺序：模型输出用集合校验，页面按这里的顺序分节。
+# 只有 ASR 转写稿需要校对；RSS 拿到的是已发布的文字，纠错既没用也浪费调用。
+# 同一个 correct 阶段因此有两种说法，按任务类型取。
+STAGE_LABELS_BY_KIND={'rss':{'correct':'跳过校对'}}
+# 主题的唯一权威定义：默认词表覆盖 AI、开源、时事、娱乐等多条内容线。
 # 展示顺序是编辑决定的，不能交给模板或数据库排序（中文字符串排序没有语义）。
-TOPIC_ORDER=('技术','产品','行业','研究','其他')
+# 站点可通过 config.toml 的 [topics] order 覆盖主题列表；兜底项固定为“其他”，
+# 不在词表里，始终排在最后，避免“末项即兜底”这种隐式约定把正常主题吞掉。
+TOPIC_FALLBACK='其他'
+TOPIC_ORDER=('AI 与大模型','开发与开源','产品与应用','行业与公司','政策与监管','安全与隐私',
+             '时事','游戏','动漫','影视','科技硬件','研究')
+DEFAULT_TOPIC_ORDER=TOPIC_ORDER
 
 
-def topic_name(value):
+def topic_order(configured=None):
+    """完整展示顺序：配置的主题列表 + 末位兜底项（已含则不再重复）。"""
+    values=tuple(configured) if configured else TOPIC_ORDER
+    return values if TOPIC_FALLBACK in values else values+(TOPIC_FALLBACK,)
+
+
+def topic_name(value,configured=None):
     """未知或缺失主题折叠到“其他”，与页面分节、统计保持同一规则。"""
-    return value if value in TOPIC_ORDER else '其他'
+    return value if value in topic_order(configured) else TOPIC_FALLBACK
+
+
 # 终端日志沿用更具体的阶段名，页面使用更短的动词短语。
 STAGE_LOG_LABELS={'acquire':'获取正文/转写','correct':'校对转写','summarize':'生成摘要','finish':'保存结果'}
 REBUILD_STATUS_LABELS={'queued':'等待处理','running':'处理中','done':'已完成','failed':'未全部完成'}
+# 阶段记录按“轮次”分组展示：一次任务的全部阶段合成一组，避免逐行流水。
+EVENT_GROUP_LABELS={'ok':'完成','started':'开始','failed':'失败'}
+
 
 # 只映射异常类型，不回显远端响应或异常正文；与流水线“阶段: 异常类型”的存储格式对应。
 ERROR_HINTS={
@@ -34,8 +53,10 @@ ERROR_HINTS={
 }
 
 
-def stage_label(stage):
-    return STAGE_LABELS.get(stage,stage or '—')
+def stage_label(stage,kind=None):
+    """阶段名；RSS 没有校对这回事，同一阶段按任务类型换说法。"""
+    overrides=STAGE_LABELS_BY_KIND.get(kind or '',{})
+    return overrides.get(stage) or STAGE_LABELS.get(stage,stage or '—')
 
 
 def status_label(status):

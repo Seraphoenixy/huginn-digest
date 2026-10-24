@@ -27,7 +27,7 @@ class CoreTests(unittest.TestCase):
         self.service.enqueue('rss',self.item(url))
         task=self.service.store.query('SELECT * FROM tasks WHERE url=?',(url,))[0]
         path=self.settings.content_dir/str(task['id'])/'summary.json'
-        write_text(path,json.dumps({'topic':'技术','bullets':['事实要点']}))
+        write_text(path,json.dumps({'topic':'AI 与大模型','bullets':['事实要点']}))
         self.service.store.update(task['id'],status='done',summary_path=str(path))
         return task
 
@@ -74,7 +74,7 @@ class CoreTests(unittest.TestCase):
         self.service.enqueue('rss',self.item())
         task=self.service.store.claim()
         pipeline=ContentPipeline(self.settings,self.service.store)
-        pipeline.llm.call=Mock(return_value=json.dumps({'topic':'技术','title':'测试标题','bullets':['测试']}))
+        pipeline.llm.call=Mock(return_value=json.dumps({'topic':'AI 与大模型','title':'测试标题','bullets':['测试']}))
         with patch('orchestration.pipeline.extract',return_value=('原始正文','')):
             pipeline.run(task)
         self.assertEqual(self.service.store.task(task['id'])['status'],'done')
@@ -103,7 +103,11 @@ class CoreTests(unittest.TestCase):
         pipeline.llm.call=Mock(side_effect=RuntimeError('private'))
         result=pipeline.correct({'task_id':task['id'],'raw_path':str(path)})
         self.assertEqual(result['corrected_path'],str(path))
-        self.assertIn('纠错失败',self.service.store.task(task['id'])['warning'])
+        warning=self.service.store.task(task['id'])['warning']
+        # 失败原因要能分辨：这里是调用失败，而不是校验不过。
+        self.assertIn('调用失败',warning)
+        self.assertIn('RuntimeError',warning)
+        self.assertNotIn('private',warning,'异常消息不得进任务警告')
 
     def test_publish_idempotent_and_preserves_previous(self):
         task=self.done();first=self.service.publish(task['day'])

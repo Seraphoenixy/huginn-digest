@@ -33,7 +33,7 @@ class ReportRetentionTests(unittest.TestCase):
         service.store.execute('UPDATE tasks SET day=? WHERE id=?',(day,task['id']))
         folder=settings.content_dir/str(task['id'])
         write_text(folder/'raw.txt','转写正文')
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']},ensure_ascii=False))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']},ensure_ascii=False))
         service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'),
                              raw_path=str(folder/'raw.txt'))
         service.publish(day)

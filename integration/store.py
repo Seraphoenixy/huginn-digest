@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS login_limits(ip TEXT PRIMARY KEY,count INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS rebuilds(id INTEGER PRIMARY KEY,day TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',error TEXT NOT NULL DEFAULT '',created REAL NOT NULL DEFAULT 0,started REAL NOT NULL DEFAULT 0,updated REAL NOT NULL,batch TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS retractions(id INTEGER PRIMARY KEY,task_id INTEGER NOT NULL,day TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',created REAL NOT NULL,UNIQUE(task_id));
 CREATE UNIQUE INDEX IF NOT EXISTS rebuilds_active_day ON rebuilds(day) WHERE status IN ('queued','running');
+CREATE INDEX IF NOT EXISTS events_created ON events(created);
 '''
 
 class Store:
@@ -147,6 +148,22 @@ class Store:
             result = db.execute('INSERT OR IGNORE INTO tasks(source_id,kind,url,title,published,day,updated) VALUES(?,?,?,?,?,?,?)', (source_id,item['kind'],item['url'],item['title'],item['published'],item['day'],time.time()))
             return result.rowcount > 0
 
+    def enqueue_many(self, items):
+        """批量入队：一次事务写完，只为测试与批量导入准备。
+
+        单条 enqueue 每条都开一次事务，灌几百条时开销远大于实际写入；
+        这里保持同样的去重语义（INSERT OR IGNORE），但只提交一次。
+        """
+        rows=[(item.get('source_id'),item['kind'],item['url'],item['title'],
+               item['published'],item['day'],time.time()) for item in items]
+        if not rows:return 0
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            before=db.total_changes
+            db.executemany('INSERT OR IGNORE INTO tasks(source_id,kind,url,title,published,day,updated) '
+                           'VALUES(?,?,?,?,?,?,?)',rows)
+            return db.total_changes-before
+
     def claim(self,day=None):
         """原子认领；来源已删除的任务不认领，防止删除后仍抓取。"""
         with self.connect() as db:
@@ -182,9 +199,23 @@ class Store:
         self.execute('INSERT INTO events(task_id,stage,status,detail,created) VALUES(?,?,?,?,?)',
                      (task_id,stage,status,str(detail)[:200],time.time()))
 
-    def recent_events(self, limit=12):
-        return self.query('SELECT e.*,COALESCE(t.title,\'\') AS title FROM events e '
-                          'LEFT JOIN tasks t ON t.id=e.task_id ORDER BY e.id DESC LIMIT ?',(int(limit),))
+    def recent_events(self, limit=12, offset=0):
+        """按时间倒序取阶段记录。
+
+        offset 供分页使用：事件表只增不删（保留30天），固定每页条数既能
+        保持页面稳定，也不会因为记录增长把整页撑长。
+        """
+        limit=max(1,int(limit));offset=max(0,int(offset))
+        # 带出任务类型：同一个 correct 阶段对 RSS 是“跳过校对”、对视频才是
+        # “校对转写”，缺了 kind 只能一律显示成校对，容易误读成 RSS 也跑了纠错。
+        return self.query('SELECT e.*,COALESCE(t.title,\'\') AS title,'
+                          'COALESCE(t.kind,\'\') AS kind FROM events e '
+                          'LEFT JOIN tasks t ON t.id=e.task_id ORDER BY e.id DESC LIMIT ? OFFSET ?',
+                          (limit,offset))
+
+    def count_events(self):
+        rows=self.query('SELECT COUNT(*) AS count FROM events')
+        return int(rows[0]['count']) if rows else 0
 
     def recover(self):
         """崩溃恢复：running 任务重新排队；来源已删除的排队任务直接取消。
@@ -289,8 +320,12 @@ class Store:
                         'FROM tasks WHERE day IN ('+placeholders+') GROUP BY day',tuple(days))
         return {row['day']:(int(row['total']),int(row['done'] or 0)) for row in rows}
 
-    def dashboard_tasks(self, view='all', day=None, limit=100):
-        """管理页任务视图；状态白名单在存储层映射，不接受拼接SQL。"""
+    def dashboard_tasks(self, view='all', day=None, limit=100, offset=0):
+        """管理页任务视图；状态白名单在存储层映射，不接受拼接SQL。
+
+        排序按视图区分：'all' 是“最近发生了什么”，按更新时间倒序，刚处理完的
+        任务必须在最前；其余视图是排查用的，进行中的排前面更有用。
+        """
         statuses={'active':('queued','running'),'failed':('failed',),'done':('done',),
                   'canceled':('canceled',)}.get(view)
         clauses=[];args=[]
@@ -303,16 +338,37 @@ class Store:
         if view=='retracted':
             clauses.append('r.task_id IS NOT NULL')
         where=(' WHERE '+' AND '.join(clauses)) if clauses else ''
-        args.append(int(limit))
+        args.append(max(1,int(limit)))
+        args.append(max(0,int(offset)))
+        order=('t.updated DESC,t.id DESC' if view=='all' else
+               "CASE t.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 "
+               "WHEN 'canceled' THEN 3 ELSE 4 END,t.updated DESC,t.id DESC")
         sql=('SELECT t.*,CASE WHEN t.source_id IS NOT NULL THEN COALESCE(s.name,\'已删除的订阅来源\') '
              'WHEN t.kind=\'bili\' THEN \'B站 · 单独提交\' ELSE \'RSS · 单独提交\' END AS source_name, '
              'CASE WHEN r.task_id IS NOT NULL THEN 1 ELSE 0 END AS retracted, '
              'COALESCE(r.reason,\'\') AS retract_reason, COALESCE(r.created,0) AS retracted_at '
              'FROM tasks t LEFT JOIN sources s ON s.id=t.source_id '
              'LEFT JOIN retractions r ON r.task_id=t.id'+where+
-             " ORDER BY CASE t.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 "
-             "WHEN 'canceled' THEN 3 ELSE 4 END,t.id DESC LIMIT ?")
+             ' ORDER BY '+order+' LIMIT ? OFFSET ?')
         return self.query(sql,tuple(args))
+
+    def count_tasks(self, view='all', day=None):
+        """与 dashboard_tasks 同一套筛选条件计数，供分页使用。"""
+        statuses={'active':('queued','running'),'failed':('failed',),'done':('done',),
+                  'canceled':('canceled',)}.get(view)
+        clauses=[];args=[]
+        if statuses:
+            clauses.append('t.status IN ('+','.join('?' for _ in statuses)+')')
+            args.extend(statuses)
+        if day:
+            clauses.append('t.day=?')
+            args.append(day)
+        if view=='retracted':
+            clauses.append('r.task_id IS NOT NULL')
+        where=(' WHERE '+' AND '.join(clauses)) if clauses else ''
+        rows=self.query('SELECT COUNT(*) AS count FROM tasks t '
+                        'LEFT JOIN retractions r ON r.task_id=t.id'+where,tuple(args))
+        return int(rows[0]['count']) if rows else 0
 
     def latest(self, day):
         rows = self.query('SELECT * FROM versions WHERE day=? AND active=1 LIMIT 1',(day,))
@@ -377,8 +433,19 @@ class Store:
         rows = self.query("SELECT day,COUNT(*) AS total,COALESCE(SUM(id),0) AS ids,COALESCE(MAX(updated),0) AS updated FROM tasks WHERE status='done' GROUP BY day")
         return {row['day']:(row['total'],row['ids'],round(row['updated'],3)) for row in rows}
 
-    def prune_events(self, before):
+    def prune_events(self, before, keep_rows=0):
+        """删除过期事件，并把总量封顶在 keep_rows 行。
+
+        只按天数删不够：活跃站点一天能写数百条，30 天仍会堆到上万行，
+        分页越翻越慢。行数上限兜住这个增长，天数上限保证长期静默的站点
+        也不会留一堆旧记录。keep_rows<=0 表示只按天数删。
+        """
         self.execute('DELETE FROM events WHERE created<?',(before,))
+        keep=int(keep_rows or 0)
+        if keep<=0:return
+        # 先取封顶位置的 id，再一次删干净：比先 count 再偏移少一次全表扫描。
+        rows=self.query('SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?',(keep,))
+        if rows:self.execute('DELETE FROM events WHERE id<=?',(rows[0]['id'],))
 
     def meta(self, key):
         rows = self.query('SELECT value FROM meta WHERE key=?',(key,))

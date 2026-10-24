@@ -21,11 +21,17 @@ class SummaryCoverageTests(unittest.TestCase):
         self.assertEqual(split_text('',10),[])
         with self.assertRaises(ValueError):split_text('正文',0)
 
-    def test_more_than_eight_independent_topics_are_accepted(self):
-        result={'topic':'行业','bullets':[f'独立新闻{i}' for i in range(12)]}
-        self.assertEqual(ContentPipeline.parse_summary(json.dumps(result)),result)
-        result['bullets']=['消息']*65
-        with self.assertRaises(ValueError):ContentPipeline.parse_summary(json.dumps(result))
+    def test_many_events_are_accepted_and_oversized_bullets_rejected(self):
+        event={'topic':'行业与公司','bullets':[f'独立新闻{i}' for i in range(6)]}
+        parsed=ContentPipeline.parse_summary(json.dumps([event]*20))
+        self.assertEqual(len(parsed),20,'一条汇总来源应能拆出多条事件')
+        event['bullets']=['消息']*65
+        with self.assertRaises(ValueError):ContentPipeline.parse_summary(json.dumps([event]))
+
+    def test_too_many_events_is_rejected(self):
+        event={'topic':'行业与公司','bullets':['一条']}
+        with self.assertRaises(ValueError):
+            ContentPipeline.parse_summary(json.dumps([event]*(ContentPipeline.EVENT_MAX+1)))
 
     def test_old_cache_archived_and_unchanged_result_reused(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -39,10 +45,10 @@ class SummaryCoverageTests(unittest.TestCase):
             raw=folder/'raw.txt'
             write_text(raw,'首条新闻。末条新闻。')
             state['corrected_path']=str(raw)
-            old=json.dumps({'topic':'行业','bullets':['旧摘要']})
+            old=json.dumps({'topic':'行业与公司','bullets':['旧摘要']})
             write_text(folder/'summary.json',old)
             write_text(folder/'summary_part_0.json',old)
-            pipeline.llm.call=Mock(return_value=json.dumps({'topic':'行业','title':'合并后标题','bullets':['首条新闻','末条新闻']}))
+            pipeline.llm.call=Mock(return_value=json.dumps({'topic':'行业与公司','title':'合并后标题','bullets':['首条新闻','末条新闻']}))
             pipeline.summarize(state)
             pipeline.llm.call.assert_called_once()
             archive=list(folder.glob('previous_summary_*'))

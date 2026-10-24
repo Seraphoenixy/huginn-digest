@@ -5,6 +5,7 @@ import time
 from contextlib import contextmanager
 from threading import Event, Thread, Lock
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 from pathlib import Path
 from integration.store import Store
 from integration.files import read_text, write_text
@@ -14,7 +15,7 @@ from integration.http.public import public_url
 from integration.auth import Sessions, verify_password
 from integration.runtime_log import log
 from orchestration.runtime import RuntimeState
-from orchestration.status import stage_label, task_state, rebuild_state, explain_error, TOPIC_ORDER, topic_name
+from orchestration.status import stage_label, task_state, rebuild_state, explain_error, topic_order, topic_name
 
 TZ=timezone(timedelta(hours=8))
 
@@ -29,6 +30,10 @@ def is_final(day,now=None):
     now=datetime.fromtimestamp(time.time() if now is None else now,TZ)
     cutoff=datetime.fromisoformat(day).replace(tzinfo=TZ)+timedelta(days=1,hours=8)
     return now>=cutoff
+
+# 同题包含匹配的最小键长：两字主体（游戏、Kimi）参与包含判断会大面积误判。
+SUBJECT_MIN_LENGTH=6
+
 
 class DailyService:
     def __init__(self,settings):
@@ -266,6 +271,46 @@ class DailyService:
             except Exception:
                 raise ValueError('B站凭据保存失败，请检查Cookie、刷新口令和文件权限') from None
 
+    def configure_models(self,llm_key='',llm_base_url='',llm_model='',asr_key='',asr_model='',asr_base_url=''):
+        """管理页保存模型与密钥：只写 config.toml 的 [llm]/[asr]，密钥不回显、不落库。
+
+        空值表示“保持不变”，这样只改模型名时不必重新输入密钥。文本模型保存后
+        立即热加载（处理中则登记待应用）；转写配置在调用时读取，保存即生效。
+        """
+        from config import parse_https_url, parse_llm_config
+        from integration.config_file import save_values
+        llm_key=llm_key.strip();llm_base_url=llm_base_url.strip()
+        llm_model=llm_model.strip();asr_key=asr_key.strip();asr_model=asr_model.strip()
+        asr_base_url=asr_base_url.strip()
+        llm_patch={}
+        if llm_base_url or llm_model:
+            candidate=dict(self.settings.values.get('llm') or {})
+            if llm_base_url:candidate['base_url']=llm_base_url
+            if llm_model:candidate['model']=llm_model
+            llm=parse_llm_config({'llm':candidate})
+            if llm_base_url:llm_patch['base_url']=llm['base_url']
+            if llm_model:llm_patch['model']=llm['model']
+        if llm_key:llm_patch['api_key']=llm_key
+        if llm_patch:save_values(self.settings.config_file,'llm',llm_patch)
+        asr_patch={}
+        if asr_model:
+            if len(asr_model)>200:raise ValueError('转写模型名称过长')
+            asr_patch['model']=asr_model
+        if asr_base_url:asr_patch['base_url']=parse_https_url('asr.base_url',asr_base_url)
+        if asr_key:asr_patch['api_key']=asr_key
+        if not llm_patch and not asr_patch:raise ValueError('没有需要保存的修改')
+        if asr_patch:save_values(self.settings.config_file,'asr',asr_patch)
+        if asr_patch:
+            # 转写配置在每次调用时读取，写入后同步内存值即可生效，无需重启。
+            if 'api_key' in asr_patch:self.settings.asr_key=asr_patch['api_key']
+            if 'model' in asr_patch:self.settings.values.setdefault('asr',{})['model']=asr_patch['model']
+            if 'base_url' in asr_patch:
+                self.settings.asr_base_url=asr_patch['base_url']
+                self.settings.values.setdefault('asr',{})['base_url']=asr_patch['base_url']
+        changed,state,deferred=False,self.settings.llm_state(),False
+        if llm_patch:changed,state,deferred=self.reload_model_config()
+        return {'llm':state,'deferred':deferred,'llm_saved':bool(llm_patch),'asr_saved':bool(asr_patch)}
+
     def enqueue(self,kind,item,source_id=None):
         stamp=float(item['published'])
         if stamp>time.time()+86400:raise ValueError('来源时间异常')
@@ -353,22 +398,43 @@ class DailyService:
         broken=[]
         for task in tasks:
             try:
-                result=json.loads(read_text(task['summary_path']))
-                if not isinstance(result,dict) or not isinstance(result.get('bullets'),list):
+                payload=json.loads(read_text(task['summary_path']))
+                # 磁盘结构是 {"events":[...]}；裸数组与旧单条 dict 也要能读，
+                # 否则升级当刻的旧摘要会被整批判成损坏。
+                if isinstance(payload,dict) and isinstance(payload.get('events'),list):
+                    events=payload['events']
+                elif isinstance(payload,list):
+                    events=payload
+                else:
+                    events=[payload]
+                if not events or not all(isinstance(e,dict) and isinstance(e.get('bullets'),list) for e in events):
                     raise ValueError('摘要格式无效')
             except (OSError,TypeError,ValueError):
                 broken.append(task['id'])
                 continue
-            entries.append({'id':task['id'],'title':self._entry_title(task,result),'url':task['url'],'published':task['published'],'topic':result.get('topic'),'bullets':result['bullets'],'source_name':self._entry_source_name(task,historical)})
+            source_name=self._entry_source_name(task,historical)
+            for index,event in enumerate(events):
+                # 一个任务可以派生多条事件：id 用 task:index，锚点与撤回都按任务回指。
+                entries.append({'id':f"{task['id']}:{index}" if len(events)>1 else task['id'],
+                                'task_id':task['id'],
+                                'title':self._entry_title(task,event),
+                                'url':self._entry_url(task,event),
+                                'published':task['published'],
+                                'topic':event.get('topic'),
+                                'bullets':event['bullets'],
+                                'subject':event.get('subject') or '',
+                                'source_name':source_name})
         if broken:
             log(f'日报 {day}：{len(broken)} 条已完成任务的摘要缺失或损坏，沿用其此前条目，待重建补齐')
         # 未成功（失败、重试中或摘要损坏）的任务继续展示上一次成功条目，日报不因处理失败而缩水。
         entries=self._merge_previous(entries,previous,{task['id'] for task in self.store.query('SELECT id FROM tasks WHERE day=?',(day,))})
         # 撤回是发布层的否决，必须放在沿用旧条目之后，否则旧版本会把被撤内容带回来。
+        # 撤回粒度是任务：一个任务派生的事件一起撤，不允许只撤其中几条，
+        # 否则同一来源的事件会处在“撤了一半”的不一致状态。
         retracted=self.store.retracted_ids(day)
         if retracted:
             before=len(entries)
-            entries=[entry for entry in entries if entry['id'] not in retracted]
+            entries=[entry for entry in entries if entry.get('task_id',entry['id']) not in retracted]
             if len(entries)<before:log(f'日报 {day}：{before-len(entries)} 条已撤回条目未包含在本次发布')
         if len(entries)>len(tasks)-len(broken):
             log(f'日报 {day}：{len(entries)-(len(tasks)-len(broken))} 条未成功任务沿用上一次成功条目')
@@ -400,14 +466,25 @@ class DailyService:
         return self.store.latest(day)
 
     @staticmethod
-    def _entry_title(task,result):
+    def _entry_title(task,event):
         """标题优先用摘要里的模型标题：来源原始标题常是口语化、标题党或与正文不符。
 
         历史摘要没有该字段，回退到任务保存的来源标题，保证旧日期不改写。
         """
-        title=result.get('title') if isinstance(result,dict) else None
+        title=event.get('title') if isinstance(event,dict) else None
         if isinstance(title,str) and title.strip():return title.strip()
         return task['title']
+
+    @staticmethod
+    def _entry_url(task,event):
+        """事件自己的原文链接优先，没有就回退到该来源主链接。
+
+        链接已在解析层过了白名单，这里只做兜底：单条视频或纯文本转写拆出的
+        事件没有各自的链接，只能指回来源本身。
+        """
+        url=event.get('url') if isinstance(event,dict) else None
+        if isinstance(url,str) and url.startswith(('http://','https://')):return url
+        return task['url']
 
     def _entry_source_name(self,task,historical):
         """来源名优先沿用该任务已发布过的快照。
@@ -433,14 +510,25 @@ class DailyService:
 
     @staticmethod
     def _merge_previous(entries,previous,day_task_ids):
-        """未成功任务的旧条目按原顺序保留；已完成任务以最新摘要为准。"""
-        current={entry['id'] for entry in entries}
+        """未成功任务的旧条目按原顺序保留；已完成任务以最新摘要为准。
+
+        条目 id 可能是 task:index，也可能是旧的纯 task；两种都要能识别归属，
+        否则拆分上线后旧快照里的条目会被当成陌生 id 而丢失。
+        """
+        def owner(entry):
+            value=entry.get('task_id',entry.get('id'))
+            if isinstance(value,str) and ':' in value:value=value.split(':',1)[0]
+            try:return int(value)
+            except (TypeError,ValueError):return None
+
+        current={owner(entry) for entry in entries}
         merged=list(entries)
         for entry in previous:
-            if entry['id'] in current:continue
-            if entry['id'] not in day_task_ids:continue
+            task=owner(entry)
+            if task in current:continue
+            if task not in day_task_ids:continue
             merged.append(entry)
-        merged.sort(key=lambda entry:(entry.get('published',0),entry.get('id',0)))
+        merged.sort(key=lambda entry:(entry.get('published',0),str(entry.get('id',0))))
         return merged
 
     def retract_entry(self,task_id,reason=''):
@@ -643,28 +731,94 @@ class DailyService:
         target=day or latest
         report=self.report(target) if target else None
         return {'report':report,
-                'sections':self.sections(report),
-                'stats':self.report_stats(report,dates),
+                'sections':self.sections(report,self.settings.topic_order),
+                'stats':self.report_stats(report,dates,self.settings.topic_order),
                 'neighbors':self.neighbors(target,dates),
                 'archive':self._archive(dates,target if report else latest),
                 'dates':dates,'latest':latest,'today':day_of(time.time())}
 
     @staticmethod
-    def sections(report):
-        """按 TOPIC_ORDER 分节；缺失或未知主题归入“其他”，不参与排序。"""
-        buckets={topic:[] for topic in TOPIC_ORDER}
-        for entry in (report or {}).get('entries',[]):
-            buckets[topic_name(entry.get('topic'))].append(entry)
-        return [{'topic':topic,'entries':buckets[topic]} for topic in TOPIC_ORDER if buckets[topic]]
+    def sections(report,topics=None):
+        """按词表分节；缺失或未知主题归入“其他”，空节不出现，顺序即编辑顺序。
+
+        同时标注同题：同一事件常被多个来源分别报道（B站视频版与文字早报），
+        合并会丢内容，所以只在条目上标出“另有 N 个来源报道同一事件”，
+        由读者自己决定看哪一条。
+        """
+        order=topic_order(topics)
+        buckets={topic:[] for topic in order}
+        entries=[entry for entry in (report or {}).get('entries',[]) if isinstance(entry,dict)]
+        for entry in entries:
+            buckets[topic_name(entry.get('topic'),topics)].append(entry)
+        # 同一事件在不同来源的写法常是“主体”与“主体+动作”：
+        # 「Kimi K3.1 Pro」与「Kimi K3.1 Pro 发布」指的是同一件事。
+        # 精确相等会漏掉这种，所以按“一方包含另一方”成对归组；
+        # 条目数很小（一天几十条），直接两两比较比维护并查集更直白。
+        keys=[DailyService._subject_key(entry.get('subject')) for entry in entries]
+
+        def same_event(left,right):
+            if not left or not right:return False
+            if left==right:return True
+            # 包含匹配只对足够长的键成立：'游戏'、'Kimi' 这种过短主体一旦
+            # 参与包含判断，会把「游戏引擎更新」「Kimi 登月计划」全判成同题。
+            if len(left)<SUBJECT_MIN_LENGTH or len(right)<SUBJECT_MIN_LENGTH:return False
+            return left in right or right in left
+
+        counts=[0]*len(keys)
+        for i,key in enumerate(keys):
+            for j,other in enumerate(keys):
+                if same_event(key,other):counts[i]+=1
+        for entry,repeat in zip(entries,counts):
+            # 只在多来源重复时给提示；单条事件不需要“唯一”这种噪音。
+            if repeat>1:entry['repeat']=repeat
+        # 分组视图：同题条目收进同一个块，块标题写明有几个来源。
+        # 页面据此直接呈现“这几条讲的是同一件事”，不必让读者逐条比标记。
+        # 归一化键不同但互为包含的（「Kimi K3.1 Pro」与「Kimi K3.1 Pro 发布」）
+        # 必须聚成一组，所以按“与组内任一条同题”归并，而不是按键相等。
+        # 单条事件各自成组，模板用同一套循环渲染，不需要分支。
+        clusters=[]
+        groups=[]
+        for entry,key,repeat in zip(entries,keys,counts):
+            if repeat<=1 or not key:
+                groups.append({'label':'','size':1,'entries':[entry]})
+                continue
+            target=None
+            for group in clusters:
+                if any(same_event(key,other) for other in group['keys']):
+                    target=group;break
+            if target is None:
+                target={'entries':[],'keys':set()}
+                clusters.append(target)
+                groups.append(target)
+            target['entries'].append(entry)
+            target['keys'].add(key)
+        for group in groups:
+            group['size']=len(group['entries'])
+            group.pop('keys',None)
+            group['label']=f'同一事件 · {group["size"]} 个来源' if group['size']>1 else ''
+        # 每组只挂在本组首条所属的节下，跨节同名不会被拆到两处。
+        by_topic={topic:[] for topic in order}
+        for group in groups:
+            topic=topic_name(group['entries'][0].get('topic'),topics)
+            by_topic[topic].append(group)
+        return [{'topic':topic,'entries':buckets[topic],'groups':by_topic[topic]}
+                for topic in order if buckets[topic]]
 
     @staticmethod
-    def report_stats(report,dates=None):
+    def _subject_key(subject):
+        """同题比较用的归一化键：忽略空白、大小写与首尾标点。"""
+        if not isinstance(subject,str):return ''
+        value=''.join(subject.split()).lower()
+        return value.strip('，,。.、:：?!！?')
+
+    @staticmethod
+    def report_stats(report,dates=None,topics=None):
         entries=(report or {}).get('entries',[]) or []
         stamps=[float(entry['published']) for entry in entries
                 if isinstance(entry.get('published'),(int,float)) and entry['published']>0]
         return {'entries':len(entries),
                 'sources':len({entry.get('source_name') for entry in entries if entry.get('source_name')}),
-                'topics':len({topic_name(entry.get('topic')) for entry in entries}),
+                'topics':len({topic_name(entry.get('topic'),topics) for entry in entries}),
                 'first':min(stamps) if stamps else None,
                 'last':max(stamps) if stamps else None,
                 'archive_days':len(dates or [])}
@@ -708,18 +862,40 @@ class DailyService:
         if not report:return {'day':None,'count':0,'titles':[],'updated':None}
         return {key:report[key] for key in ('day','updated','final')}|{'count':len(report['entries']),'titles':[e['title'] for e in report['entries'][:3]]}
 
-    def dashboard(self, view='all', day=None):
+    TASK_PAGE_SIZE=50
+
+    def dashboard(self, view='all', day=None, events_page=1, tasks_page=1):
         """管理页唯一数据来源；不含凭据，不触发采集、模型调用或配置变更。"""
         counts=self.store.task_counts()
-        tasks=self.store.dashboard_tasks(view,day)
+        size=self.TASK_PAGE_SIZE
+        total_tasks=self.store.count_tasks(view,day)
+        task_pages=max(1,(total_tasks+size-1)//size)
+        try:task_page=int(tasks_page)
+        except (TypeError,ValueError):task_page=1
+        task_page=min(max(1,task_page),task_pages)
+        tasks=self.store.dashboard_tasks(view,day,size,(task_page-1)*size)
         now=time.time()
         total_limit=self.settings.get('worker','max_total_attempts',10)
+        # 一条任务可能派生多条日报条目（汇总类来源），列表里标出数量，
+        # 便于判断某个来源到底贡献了几件事、撤回会牵连多少条。
+        published_counts={}
+        # 按列表里出现的日期逐个取最新版本：默认视图不传 day，只看一天会算成 0。
+        for task_day in {task.get('day') for task in tasks if task.get('day')}:
+            latest=self.store.latest(task_day)
+            if not latest:continue
+            for entry in self._previous_entries(latest):
+                owner=entry.get('task_id',entry.get('id'))
+                if isinstance(owner,str) and ':' in owner:owner=owner.split(':',1)[0]
+                try:owner=int(owner)
+                except (TypeError,ValueError):continue
+                published_counts[owner]=published_counts.get(owner,0)+1
         for task in tasks:
+            task['entry_count']=published_counts.get(task['id'],0)
             task['exhausted']=task['status']=='failed' and task['attempts']>=total_limit
             task.update(task_state(task,now))
             task['error_text']=explain_error(task.get('error'))
             task['warning_text']=task.get('warning') or ''
-            task['stage_text']=stage_label(task.get('stage'))
+            task['stage_text']=stage_label(task.get('stage'),task.get('kind'))
         rebuilds=self.store.rebuilds(20)
         progress=self.store.day_progress([job['day'] for job in rebuilds])
         for job in rebuilds:
@@ -728,12 +904,72 @@ class DailyService:
             total,done=progress.get(job['day'],(0,0))
             job['total'],job['done']=total,done
             job['progress']=round(100*done/total) if total else None
+        events=self.event_log(events_page)
         return {'sources':self.store.sources(),'tasks':tasks,'task_counts':counts,'view':view,'day_filter':day or '',
                 'rebuilds':rebuilds,'active_rebuilds':self.store.active_rebuilds(),
-                'events':self.store.recent_events(8),'dates':self.dates(),
+                'events':events['groups'],'events_page':events['page'],'events_pages':events['pages'],
+                'events_total':events['total'],'dates':self.dates(),
+                'tasks_page':task_page,'tasks_pages':task_pages,'tasks_total':total_tasks,
                 'worker_heartbeat':self.store.meta('heartbeat'),'activity':self.runtime.snapshot(),
                 'configured':{'asr':bool(self.settings.asr_key),'llm':bool(self.settings.llm_key)},
-                'llm':self.settings.llm_state(),'storage':self.storage_state(),'now':now}
+                # 地址与模型名按用户要求完整回显；密钥始终只回“是否配置”。
+                'llm':{**self.settings.llm_state(),'base_url':self.settings.llm_base_url},
+                'asr':{'configured':bool(self.settings.asr_key),'model':self.settings.get('asr','model',''),
+                       'host':urlsplit(self.settings.asr_base_url).hostname or '',
+                       'base_url':self.settings.asr_base_url},
+                'storage':self.storage_state(),'now':now}
+
+    EVENT_PAGE_SIZE=20
+    # 事件记录双上限：按天保证长期静默也能清干净，按行保证活跃时不失控。
+    EVENT_RETENTION_DAYS=30
+    EVENT_MAX_ROWS=20000
+
+    def event_log(self, page=1):
+        """阶段记录分页并按任务聚合，一次处理显示为一条时间线。
+
+        事件按“阶段开始/结束”成对写入，逐行铺开既长又重复；这里把同一任务
+        聚合成一轮，行内只保留阶段与耗时，详情收进可展开的说明。
+        """
+        size=self.EVENT_PAGE_SIZE
+        total=self.store.count_events()
+        pages=max(1,(total+size-1)//size)
+        try:page=int(page)
+        except (TypeError,ValueError):page=1
+        page=min(max(1,page),pages)
+        rows=self.store.recent_events(size,(page-1)*size)
+        groups=[]
+        index={}
+        for row in reversed(rows):
+            key=row['task_id']
+            group=index.get(key)
+            if group is None:
+                group={'task_id':key,'title':row['title'],'stages':[],'latest':row['created'],
+                       'failed':False,'running':False}
+                index[key]=group
+                groups.append(group)
+            label=stage_label(row['stage'],row.get('kind'))
+            status=row['status']
+            if status=='started':
+                group['stages'].append({'label':label,'state':'run','detail':'','at':row['created']})
+                group['running']=True
+            else:
+                target=None
+                for stage in reversed(group['stages']):
+                    if stage['label']==label and stage['state']=='run':target=stage;break
+                if target is None:
+                    target={'label':label,'state':'ok','detail':'','at':row['created']}
+                    group['stages'].append(target)
+                target['state']='ok' if status=='ok' else 'danger'
+                target['detail']=row['detail'] or ''
+                target['at']=row['created']
+                if status!='ok':group['failed']=True
+            group['latest']=max(group['latest'],row['created'])
+        for group in groups:
+            group['running']=any(stage['state']=='run' for stage in group['stages'])
+            group['state']='danger' if group['failed'] else ('run' if group['running'] else 'ok')
+            group['state_label']='失败' if group['failed'] else ('处理中' if group['running'] else '完成')
+        groups.sort(key=lambda item:(item['running'],item['latest']),reverse=True)
+        return {'groups':groups,'page':page,'pages':pages,'total':total}
 
     def activity_status(self):
         """轻量实时状态；供管理页高频轮询，不读取任务列表或日报。"""
@@ -822,21 +1058,34 @@ class DailyService:
         self._touch_heartbeat(force=True)
 
     def run_cleanup(self):
-        """执行一次空间清理并记录可核对的结果；Web手动入口与定时任务共用。"""
+        """执行一次空间清理并记录可核对的结果；Web手动入口与定时任务共用。
+
+        文件清理与事件清理互不依赖，分别兜住各自的异常：文件清理失败时
+        仍要整理事件记录，否则一次磁盘异常会让事件表长期不收敛。
+        """
         from integration.cleanup import cleanup, disk_usage
         started=time.time()
         self._cleanup_at=started
         self.runtime.begin('cleanup','清理存储空间',detail='按保留期删除可再生产物')
         self._touch_heartbeat(force=True)
         try:
-            result=cleanup(self.settings,self.store.query('SELECT id,status FROM tasks'))
-            self.store.prune_events(started-30*86400)
+            result={'files':0,'bytes':0}
+            file_error=''
+            try:
+                result=cleanup(self.settings,self.store.query('SELECT id,status FROM tasks'))
+            except Exception as exc:
+                file_error=type(exc).__name__
+                log(f'空间清理失败（{file_error}），改为只整理事件记录；下一轮重试')
+            self.store.prune_events(started-self.EVENT_RETENTION_DAYS*86400,self.EVENT_MAX_ROWS)
             usage=disk_usage(self.settings)
             self.store.set_meta('cleanup_at',started)
             self.store.set_meta('cleanup_files',result['files'])
             self.store.set_meta('cleanup_bytes',result['bytes'])
             self.store.set_meta('cleanup_usage',usage['total'])
-            self.store.set_meta('cleanup_error','')
+            self.store.set_meta('cleanup_error',file_error)
+            if file_error:
+                # 文件没清干净要如实返回失败，不能因为事件清理成功就报成功。
+                return None
             if result['files']:
                 log(f'空间清理：移除 {result["files"]} 个文件，释放 {result["bytes"]/1048576:.1f} MB；'
                     f'当前占用 {usage["total"]/1048576:.1f} MB')

@@ -1,8 +1,8 @@
 (() => {
-  // 两层刷新：
+  // 三层刷新，任何一层都不整页重绘：
   // 1) /admin/status 轻量轮询，只更新当前动作、阶段、进度与计数，间隔即配置值；
-  // 2) /admin 整页片段刷新只更新任务/来源/重建列表，间隔为其 6 倍（至少 15 秒），
-  //    避免每秒重渲染表格，同时保证列表最终一致。
+  // 2) /admin 片段刷新只更新 [data-live-region] 区域，间隔为其 6 倍（至少 15 秒）；
+  // 3) 表单提交与视图切换用 fetch，成功后就地替换同一批区域，不重新加载页面。
   const status = document.querySelector('#dashboard-refresh-status');
   if (!status) return;
   const seconds = Number(status.dataset.refreshSeconds);
@@ -17,9 +17,17 @@
   let expired = false;
   let listDue = Date.now() + listInterval;
   let lastActivity = null;
+  let actionRequest = null;
 
   const setStatus = text => {
     if (status.textContent !== text) status.textContent = text;
+  };
+
+  const actionStatus = document.querySelector('#dashboard-action-status');
+  const say = (text, failed = false) => {
+    if (!actionStatus) return;
+    if (actionStatus.textContent !== text) actionStatus.textContent = text;
+    actionStatus.classList.toggle('text-danger', Boolean(failed));
   };
 
   const showExpired = () => {
@@ -123,6 +131,47 @@
     lastActivity = data;
   };
 
+  // 把另一个文档里的同源片段换进来；只动 [data-live-region]，页面其余部分（含滚动位置）保持不变。
+  const applyRegions = (page, sortVersion) => {
+    const csrf = page.querySelector('input[name="token"]')?.value;
+    if (csrf) {
+      document.querySelectorAll('input[name="token"]').forEach(input => { input.value = csrf; });
+      const sources = document.querySelector('#source-list');
+      if (sources) sources.dataset.token = csrf;
+    }
+    const current = page.querySelector('a.seg.seg--current');
+    if (current) {
+      const href = current.getAttribute('href');
+      document.querySelectorAll('a.seg').forEach(link => {
+        const on = link.getAttribute('href') === href;
+        link.classList.toggle('seg--current', on);
+        if (on) link.setAttribute('aria-current', 'page');
+        else link.removeAttribute('aria-current');
+      });
+    }
+    document.querySelectorAll('[data-live-region]').forEach(target => {
+      // 外层区域换掉后，被包含的内层区域已脱离文档，无需再处理。
+      if (!target.isConnected) return;
+      const next = page.querySelector(`[data-live-region="${target.dataset.liveRegion}"]`);
+      if (!next) return;
+      // 已有未保存改动时不换，避免轮询把正在填的内容清掉。
+      const dirty = [...target.querySelectorAll('input, select, textarea')]
+        .some(field => field.type !== 'hidden' && field.value !== field.defaultValue);
+      if (dirty) return;
+      // 正在输入的控件不换，避免打断输入与选择；按钮失焦可以接受。
+      const focused = document.activeElement;
+      const editing = target.contains(focused) && focused !== target
+        && (focused.matches('input, textarea, select') || focused.isContentEditable);
+      if (editing) return;
+      if (target.id === 'source-list' && target.dataset.sorting === 'true') return;
+      if (sortVersion !== undefined && target.id === 'source-list'
+        && (target.dataset.sortVersion || '') !== sortVersion) return;
+      if (target.innerHTML === next.innerHTML) return;
+      target.replaceChildren(...next.childNodes);
+      target.dispatchEvent(new Event('dashboard:updated'));
+    });
+  };
+
   const scheduleLive = () => {
     clearTimeout(liveTimer);
     if (!expired && !document.hidden) liveTimer = setTimeout(pollLive, liveInterval);
@@ -167,7 +216,7 @@
     listRequest = current;
     const timeout = setTimeout(() => current.abort(), 12000);
     try {
-      const response = await fetch('/admin', {
+      const response = await fetch(`${location.pathname}${location.search}`, {
         credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: current.signal,
       });
       if (response.status === 401 || response.status === 403) {
@@ -177,25 +226,7 @@
       if (!response.ok) throw new Error('list');
       const page = new DOMParser().parseFromString(await response.text(), 'text/html');
       if (!page.querySelector('#dashboard-refresh-status')) throw new Error('list');
-      const csrf = page.querySelector('input[name="token"]')?.value;
-      if (csrf) {
-        document.querySelectorAll('input[name="token"]').forEach(input => { input.value = csrf; });
-        const sources = document.querySelector('#source-list');
-        if (sources) sources.dataset.token = csrf;
-      }
-      const regions = ['sources', 'task-panel', 'task-count', 'source-count'].map(name => ({
-        target: document.querySelector(`[data-live-region="${name}"]`),
-        next: page.querySelector(`[data-live-region="${name}"]`),
-      })).filter(region => region.target && region.next);
-      for (const {target, next} of regions) {
-        // 保留正在操作的表格与排序过程，不触碰订阅/视频/日期输入表单。
-        if (target.contains(document.activeElement)) continue;
-        if (target.id === 'source-list' && target.dataset.sorting === 'true') continue;
-        if (target.id === 'source-list' && (target.dataset.sortVersion || '') !== sortVersion) continue;
-        if (target.innerHTML === next.innerHTML) continue;
-        target.replaceChildren(...next.childNodes);
-        target.dispatchEvent(new Event('dashboard:updated'));
-      }
+      applyRegions(page, sortVersion);
     } catch (_) {
       // 列表刷新失败不回退实时状态文案，下一次照常重试。
     } finally {
@@ -204,6 +235,127 @@
       scheduleList();
     }
   };
+
+  const detailOf = async response => {
+    const type = response.headers.get('content-type') || '';
+    if (!type.includes('application/json')) return '';
+    try {
+      const data = await response.json();
+      return data && data.detail ? String(data.detail) : '';
+    } catch (_) {
+      return '';
+    }
+  };
+
+  // 写操作：提交后按重定向结果就地替换区域，不触发整页导航。
+  const submitAction = async (form, submitter) => {
+    if (actionRequest) return;
+    const button = submitter && submitter.tagName === 'BUTTON' ? submitter : form.querySelector('button');
+    const sortVersion = document.querySelector('#source-list')?.dataset.sortVersion || '';
+    const current = new AbortController();
+    actionRequest = current;
+    if (button) button.disabled = true;
+    say('正在提交…');
+    try {
+      const response = await fetch(form.action, {
+        method: 'POST', body: new FormData(form), credentials: 'same-origin',
+        redirect: 'follow', signal: current.signal,
+        headers: {Accept: 'text/html, application/json'},
+      });
+      if (response.status === 401) {
+        showExpired();
+        return;
+      }
+      if (!response.ok) {
+        const detail = await detailOf(response);
+        say(detail || `操作失败（${response.status}），页面内容未改动。`, true);
+        return;
+      }
+      const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+      if (!page.querySelector('#dashboard-refresh-status')) throw new Error('page');
+      // 提交后让输入框失焦，区域才会被替换成服务端的新值。
+      if (form.contains(document.activeElement)) document.activeElement.blur();
+      applyRegions(page, sortVersion);
+      // 提交成功后才清空输入，失败时保留用户已填内容。
+      if (form.hasAttribute('data-reset')) form.reset();
+      if (response.url && response.url !== location.href) history.replaceState(null, '', response.url);
+      say('已更新');
+      listDue = Date.now() + listInterval;
+      pollLive();
+    } catch (_) {
+      say('操作提交失败，请重试；页面内容未改动。', true);
+    } finally {
+      actionRequest = null;
+      if (button) button.disabled = false;
+    }
+  };
+
+  // 视图切换：只换任务面板与计数，地址栏同步，前进后退仍可用。
+  const navigate = async (url, push) => {
+    if (actionRequest) return;
+    const current = new AbortController();
+    actionRequest = current;
+    try {
+      const response = await fetch(url, {
+        credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+        signal: current.signal, headers: {Accept: 'text/html'},
+      });
+      if (response.status === 401) {
+        showExpired();
+        return;
+      }
+      if (!response.ok) {
+        location.href = url;
+        return;
+      }
+      const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+      if (!page.querySelector('#dashboard-refresh-status')) {
+        location.href = url;
+        return;
+      }
+      applyRegions(page);
+      if (push) history.pushState(null, '', url);
+      say('');
+      listDue = Date.now() + listInterval;
+      pollLive();
+    } catch (_) {
+      location.href = url;
+    } finally {
+      actionRequest = null;
+    }
+  };
+
+  document.addEventListener('submit', event => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    if (expired) {
+      event.preventDefault();
+      return;
+    }
+    if (form.hasAttribute('data-async')) {
+      event.preventDefault();
+      submitAction(form, event.submitter);
+      return;
+    }
+    if (form.hasAttribute('data-async-nav')) {
+      event.preventDefault();
+      const target = new URL(form.action, location.href);
+      new URLSearchParams(new FormData(form)).forEach((value, key) => target.searchParams.set(key, value));
+      navigate(target.toString(), true);
+    }
+  });
+
+  document.addEventListener('click', event => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const link = event.target.closest('a[data-async-nav]');
+    if (!link || expired) return;
+    event.preventDefault();
+    navigate(link.href, true);
+  });
+
+  window.addEventListener('popstate', () => {
+    if (!expired) navigate(location.href, false);
+  });
 
   document.addEventListener('visibilitychange', () => {
     clearTimeout(liveTimer);
@@ -222,6 +374,7 @@
     clearTimeout(listTimer);
     liveRequest?.abort();
     listRequest?.abort();
+    actionRequest?.abort();
   });
   window.addEventListener('pageshow', event => {
     if (event.persisted) {

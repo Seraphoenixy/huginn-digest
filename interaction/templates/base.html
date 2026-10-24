@@ -145,6 +145,11 @@ footer{margin-top:var(--s7);padding-top:var(--s5);border-top:1px solid var(--str
 .card{background:var(--surface);border:1px solid var(--stroke);border-radius:var(--r-card);padding:var(--s5);box-shadow:var(--shadow-2)}
 .card__title{font-size:18px;margin:0 0 var(--s2)}
 .card .meta{margin-bottom:var(--s4)}
+/* 这说明文字的边距是给卡片里成段的说明用的；一旦落在弹性行里，居中对齐的是
+   外边距盒，下边距会把文字顶偏半行。凡是行内排布的说明统一归零。 */
+.section-head .meta,.status__action .meta,.status__row .meta,.card__foot .meta,
+.runlog__head .meta,.runlog__stages .meta,.pager .meta,.activity__model .meta,
+.model-row .meta,.toolbar .meta,.row-actions .meta,.form-row .meta{margin-bottom:0}
 .card .form-row{margin-top:var(--s4)}
 
 .btn{
@@ -182,9 +187,11 @@ input[type=date]{min-width:160px}
 .form-row{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap}
 .form-row input,.form-row select{flex:1 1 200px;min-width:0}
 .form-row .btn{flex:0 0 auto}
+/* 卡片里的说明文字默认带下边距；放进弹性行会把中线顶偏，这里归零让提示与按钮同轴。 */
+.form-row .meta{margin-bottom:0}
 form.inline{display:inline-flex;align-items:center;vertical-align:middle;margin:0}
 
-.pill{display:inline-flex;align-items:center;gap:6px;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600;line-height:1.7;color:var(--accent);background:var(--accent-tint);border:1px solid var(--accent-line)}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600;line-height:1.7;white-space:nowrap;color:var(--accent);background:var(--accent-tint);border:1px solid var(--accent-line)}
 .pill--ok{color:var(--ok);background:var(--ok-tint);border-color:var(--ok-line)}
 .pill--muted{color:var(--text-3);background:var(--surface-2);border-color:var(--stroke-strong)}
 
@@ -264,6 +271,11 @@ tbody td>form,.row-actions>form,.form-actions>form{display:flex;align-items:cent
 .entry__head h3{min-width:0;margin:0;font-size:17px;transition:color .12s ease}
 .entry__head:hover h3{color:var(--accent)}
 .entry__count{flex:0 0 auto;font-size:12px;color:var(--text-3);white-space:nowrap}
+/* 同一事件分组：把重复报道的条目框在一起，隔离视觉上与普通条目区分。 */
+.same-event{position:relative;padding:var(--s3) var(--s3) var(--s1);margin-bottom:var(--s3);background:var(--surface-2);border:1px dashed var(--stroke-strong);border-radius:var(--r-card)}
+.same-event__label{margin:0 0 var(--s2);font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--text-3)}
+.same-event .entry{margin-bottom:var(--s2);background:var(--surface)}
+.same-event .entry:last-child{margin-bottom:0}
 .entry__body{padding:var(--s4) var(--s5) var(--s5)}
 .entry[open]>.entry__head{border-bottom:1px solid var(--stroke);border-radius:var(--r-card) var(--r-card) 0 0}
 .entry__body ul{margin:0 0 var(--s4);padding-left:20px}
@@ -337,8 +349,31 @@ tbody td>form,.row-actions>form,.form-actions>form{display:flex;align-items:cent
 .activity__progress{display:flex;flex-direction:column;gap:6px;flex:0 1 280px;min-width:180px}
 .activity__chips{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .activity__model{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+/* 运行状态：一行状态、一行动作、一条进度。 */
+.status{display:flex;flex-direction:column;gap:var(--s3);margin-top:var(--s4)}
+.status__row{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);flex-wrap:wrap}
+.status__meta{font-size:12px;color:var(--text-3)}
+.status__action{display:flex;align-items:baseline;gap:var(--s2);flex-wrap:wrap;min-width:0}
+.status__label{font-family:var(--font-display);font-size:18px;font-weight:600;color:var(--text)}
+.status__detail{font-size:14px;color:var(--text-2);overflow-wrap:anywhere}
+.status__progress{display:flex;align-items:center;gap:var(--s3)}
+.status__progress .progress{flex:1 1 auto}
+.status__chips{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 
-.state{display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:var(--text-2)}
+/* 卡片脚注：左侧说明、右侧动作。 */
+.card__foot{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);flex-wrap:wrap;margin-top:var(--s4);padding-top:var(--s3);border-top:1px solid var(--stroke)}
+.card__foot .meta{margin:0}
+
+/* 设置行：左标签右值，参考 Fluent 设置页。 */
+.settings-rows{display:flex;flex-direction:column;margin-top:var(--s2)}
+.settings-row{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s4);padding:10px 0;border-bottom:1px solid var(--stroke)}
+.settings-row:last-child{border-bottom:0}
+.settings-row__label{font-size:13px;color:var(--text-3)}
+.settings-row__value{font-size:14px;font-weight:600;color:var(--text);text-align:right;font-variant-numeric:tabular-nums}
+/* 维护类行与占用行分开：它们不参与合计，混在一起会让人误以为对不上。 */
+.settings-rows--muted{margin-top:var(--s2);padding-top:var(--s2);border-top:1px dashed var(--stroke)}
+
+.state{display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:600;color:var(--text-2);white-space:nowrap}
 .state__dot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:var(--text-3)}
 .state--ok .state__dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-tint)}
 .state--ok{color:var(--ok)}
@@ -356,7 +391,7 @@ tbody td>form,.row-actions>form,.form-actions>form{display:flex;align-items:cent
 }
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 
-.chip{display:inline-flex;align-items:center;gap:6px;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600;line-height:1.8;background:var(--surface-2);border:1px solid var(--stroke-strong);color:var(--text-2)}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:600;line-height:1.8;white-space:nowrap;background:var(--surface-2);border:1px solid var(--stroke-strong);color:var(--text-2)}
 .chip--run{color:var(--accent);background:var(--accent-tint);border-color:var(--accent-line)}
 .chip--warn{color:#8a6508;background:rgba(184,134,11,.10);border-color:rgba(184,134,11,.32)}
 .chip--danger{color:var(--danger);background:var(--danger-tint);border-color:var(--danger-line)}
@@ -386,15 +421,29 @@ tbody td>form,.row-actions>form,.form-actions>form{display:flex;align-items:cent
 .kv>div{display:flex;flex-direction:column;gap:2px;min-width:0}
 .kv dt{font-size:12px;color:var(--text-3)}
 .kv dd{margin:0;font-size:14px;font-weight:600;color:var(--text);overflow-wrap:anywhere}
+/* 模型配置：两行常开表单，标签在行首。 */
+.model-list{display:flex;flex-direction:column;gap:var(--s2);margin-top:var(--s4)}
+.model-row{border:1px solid var(--stroke);border-radius:var(--r-card);background:var(--surface-2);padding:10px var(--s4)}
+.model-row__name{margin:0;font-size:13px;font-weight:600;color:var(--text)}
+.model-row form{margin-top:var(--s2)}
+.model-row .btn{flex:0 0 auto}
 
-.events summary{cursor:pointer;font-size:14px;font-weight:600;color:var(--text-2)}
-.events summary:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:var(--r-ctrl)}
-.timeline{display:flex;flex-direction:column;gap:6px;margin:var(--s4) 0 0;padding:0;list-style:none}
-.timeline li{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;padding-bottom:6px;font-size:13px;color:var(--text-2);border-bottom:1px solid var(--stroke)}
-.timeline li:last-child{border-bottom:0;padding-bottom:0}
-.timeline__time{flex:0 0 auto;font-variant-numeric:tabular-nums;color:var(--text-3)}
-.timeline__text{flex:1 1 220px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.timeline__stage{flex:0 0 auto;font-weight:600;color:var(--text)}
+/* 阶段记录：一次处理折叠成一行，展开看各阶段；分页在卡片底部。 */
+.runlog{display:flex;flex-direction:column;margin:0;padding:0;list-style:none}
+.runlog__item{border-bottom:1px solid var(--stroke)}
+.runlog__item:last-child{border-bottom:0}
+.runlog__group>summary{display:flex;align-items:center;gap:var(--s3);padding:10px 0;list-style:none;cursor:pointer}
+.runlog__group>summary::-webkit-details-marker{display:none}
+.runlog__group>summary::marker{content:""}
+.runlog__group>summary:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:var(--r-ctrl)}
+.runlog__head:hover .runlog__title{color:var(--accent)}
+.runlog__title{flex:1 1 auto;min-width:0;font-size:14px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.runlog__time{flex:0 0 auto;font-size:12px;color:var(--text-3);font-variant-numeric:tabular-nums}
+.runlog__stages{display:flex;flex-direction:column;gap:6px;margin:0 0 var(--s3);padding:0 0 0 var(--s4);list-style:none;border-left:1px solid var(--stroke)}
+.runlog__stages li{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;padding-left:var(--s3);font-size:13px;color:var(--text-2)}
+.runlog__stage{flex:0 0 auto;min-width:64px;font-weight:600;color:var(--text)}
+.pager--inline{display:flex;align-items:center;justify-content:flex-end;gap:var(--s2);margin-top:var(--s4);padding-top:var(--s3);border-top:1px solid var(--stroke)}
+.pager--inline .btn[aria-disabled="true"]{opacity:.45;cursor:default}
 
 .grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--s4);margin-top:var(--s4)}
 .form-actions{display:flex;align-items:center;justify-content:flex-end;gap:var(--s3);margin-top:var(--s6);padding-top:var(--s4);border-top:1px solid var(--stroke)}
@@ -490,7 +539,6 @@ tbody td>form,.row-actions>form,.form-actions>form{display:flex;align-items:cent
   <div class="header-inner">
     <a class="brand" href="/">{{ site }}</a>
     <nav>
-      {% if nav_url %}<a href="{{ nav_url }}">返回导航 ↗</a>{% endif %}
       <a href="/">最新日报</a>
       {% if authenticated %}<a href="/admin">管理后台 · 已登录</a>{% else %}<a href="/admin/login">管理登录</a>{% endif %}
     </nav>

@@ -28,7 +28,7 @@ class ArchiveTreeTests(unittest.TestCase):
         task=self.service.store.query('SELECT * FROM tasks WHERE url=?',(url,))[0]
         self.service.store.execute('UPDATE tasks SET day=? WHERE id=?',(day,task['id']))
         folder=self.settings.content_dir/str(task['id'])
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']},ensure_ascii=False))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']},ensure_ascii=False))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
         self.service.publish(day)
 
@@ -96,7 +96,7 @@ class ArchiveLayoutTests(unittest.TestCase):
         task=self.service.store.query('SELECT * FROM tasks WHERE url=?',(url,))[0]
         self.service.store.execute('UPDATE tasks SET day=? WHERE id=?',(day,task['id']))
         folder=self.settings.content_dir/str(task['id'])
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']},ensure_ascii=False))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']},ensure_ascii=False))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
         self.service.publish(day)
 

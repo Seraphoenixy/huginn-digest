@@ -1,6 +1,7 @@
 """唯一处理图：获取→纠错→摘要→完成。state只含ID和路径。"""
 import json
 import hashlib
+import re
 import shutil
 import time
 from typing import TypedDict
@@ -13,7 +14,7 @@ from model.asr import CloudASR
 from model.text import TextModel
 from integration.runtime_log import log
 from orchestration.terminology import apply_terms,check_terms,term_pattern
-from orchestration.status import STAGE_LOG_LABELS, TOPIC_ORDER
+from orchestration.status import STAGE_LOG_LABELS, stage_label, topic_order, topic_name
 
 
 class SourceDeleted(RuntimeError):
@@ -51,6 +52,30 @@ class SourceDeleted(RuntimeError):
     """来源在处理途中被删除；任务应终止并标记取消，而不是重试。"""
 
 
+class CorrectionRejected(ValueError):
+    """模型有返回，但内容没通过校验（改数字、漏正文等）。
+
+    与“调用失败”区分开：前者说明模型行为不合规，后者说明链路有问题，
+    两者在任务警告里必须写成不同的话，否则排查时会找错方向。
+
+    消息只能是固定枚举词，不能拼进原文或异常原文：纠错材料是正文，
+    而正文里可能含凭据，一旦回显就会进日志与任务警告。
+    """
+
+    REASONS=('疑似遗漏正文','改变了数字','格式无效')
+
+    @classmethod
+    def reason_of(cls,original,result,min_ratio=0.75):
+        """按校验规则判定失败类别，只返回枚举词，不带任何内容片段。"""
+        import re
+        if not isinstance(result,str) or not result.strip() or result.strip().startswith('```'):
+            return '格式无效'
+        compact=lambda value:re.sub(r'\s+|【待核】','',value)
+        if len(compact(result))<len(compact(original))*min_ratio:
+            return '疑似遗漏正文'
+        return '改变了数字'
+
+
 class ContentPipeline:
     def __init__(self, settings, store, progress=None):
         self.settings, self.store = settings, store
@@ -77,21 +102,29 @@ class ContentPipeline:
     def traced(self, name):
         def node(state):
             task_id=state['task_id']
+            task=self.store.task(task_id) or {}
+            kind=task.get('kind')
+            # 纠错只发生在 ASR 转写稿上；RSS 跳过时不记录这个阶段，
+            # 否则事件日志会显示一条假的“校对转写”。
+            skipped=(name=='correct' and (kind!='bili' or not self.settings.pipeline_correction))
+            label=stage_label(name,kind) if name=='correct' else STAGE_LOG_LABELS[name]
             self.store.update(task_id,stage=name)
-            self.store.event(task_id,name,'started',STAGE_LOG_LABELS[name])
-            self.report(name,f'开始{STAGE_LOG_LABELS[name]}')
+            if not skipped:
+                self.store.event(task_id,name,'started',label)
+                self.report(name,f'开始{label}')
             started=time.perf_counter()
-            log(f'任务 {task_id}：开始{STAGE_LOG_LABELS[name]}')
+            if not skipped:log(f'任务 {task_id}：开始{label}')
             try:
                 result=getattr(self,name)(state)
                 elapsed=time.perf_counter()-started
-                self.store.event(task_id,name,'ok',f'耗时 {elapsed:.1f} 秒')
-                log(f'任务 {task_id}：{STAGE_LOG_LABELS[name]}完成，耗时 {elapsed:.1f} 秒')
+                if not skipped:
+                    self.store.event(task_id,name,'ok',f'耗时 {elapsed:.1f} 秒')
+                    log(f'任务 {task_id}：{label}完成，耗时 {elapsed:.1f} 秒')
                 return result
             except Exception as exc:
                 elapsed=time.perf_counter()-started
                 self.store.event(task_id,name,type(exc).__name__,f'耗时 {elapsed:.1f} 秒')
-                log(f'任务 {task_id}：{STAGE_LOG_LABELS[name]}失败（{type(exc).__name__}），耗时 {elapsed:.1f} 秒')
+                log(f'任务 {task_id}：{label}失败（{type(exc).__name__}），耗时 {elapsed:.1f} 秒')
                 raise
         return node
 
@@ -101,7 +134,17 @@ class ContentPipeline:
         return path
 
     def prompt(self,name):
-        return read_text(ROOT/'knowledge'/'prompts'/f'{name}.md')
+        """读取提示词；摘要提示词里的主题词表按当前配置渲染。
+
+        词表是站点级设置，写死在文件里会让新增内容线（时事、游戏等）落不到分节；
+        模板占位符保持固定，避免每次改词表都要改提示词文件。
+        """
+        text=read_text(ROOT/'knowledge'/'prompts'/f'{name}.md')
+        if name!='summarize':return text
+        order=topic_order(self.settings.topic_order)
+        topics='、'.join(order)
+        example=self.settings.topic_order[0] if self.settings.topic_order else '其他'
+        return text.replace('{topics}',topics).replace('{example}',example)
 
     def acquire(self,state):
         task=self.store.task(state['task_id'])
@@ -157,7 +200,8 @@ class ContentPipeline:
         material={'input':text,'title':title[:context],'prompt':self.prompt('correct'),
                   'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),
                   'chunk_chars':self.settings.get('correction','chunk_chars',4000),'context_chars':context,
-                  'min_length_ratio':self.settings.correction_min_length_ratio,'terms':terms,'version':4}
+                  'min_length_ratio':self.settings.correction_min_length_ratio,'terms':terms,
+                  'max_tokens':self.settings.get('llm','max_tokens',32000),'version':4}
         return hashlib.sha256(json.dumps(material,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
     def validate_correction(self,original,result):
@@ -167,8 +211,50 @@ class ContentPipeline:
         compact=lambda value:re.sub(r'\s+|【待核】','',value)
         if len(compact(result))<len(compact(original))*self.settings.correction_min_length_ratio:
             raise ValueError('纠错结果疑似遗漏正文')
-        if self.correction_numbers(original)!=self.correction_numbers(result):raise ValueError('纠错结果改变了数字')
+        if not self.same_numbers(original,result):
+            raise ValueError('纠错结果改变了数字')
         return result
+
+    @classmethod
+    def same_numbers(cls,original,result):
+        """数字是否一致；容忍切分与粘连差异，不容忍数值被改。
+
+        实测两种真实情形都必须放行，否则正确纠错会被判成篡改：
+          - ASR 把 Opus 5.5 粘成 oppos5.5，左边界断言只切出 5；纠错补空格后是 5.5；
+          - ASR 把 5.5 读成「5 5」，纠错合并成一个 5.5，数字个数因此减少。
+        两者都会破坏逐位对齐，所以判据改为比较“去掉单位后的数字本体拼接串”，
+        并单独校验单位与符号序列：这些语义标记任何变化都算篡改，
+        避免 2%→2、-2%→2% 被放过。
+        """
+        left=cls.correction_numbers(original)
+        right=cls.correction_numbers(result)
+        if left==right:return True
+        # 比较标记的拼接串而不是列表：数字个数可能因纠错合并而变化
+        # （两个 5 合成一个 5.5），逐项比较会把这个正常变化误判成改单位。
+        if cls._marks(left)!=cls._marks(right):return False
+        joined_left=''.join(cls._body_of(v) for v in left)
+        joined_right=''.join(cls._body_of(v) for v in right)
+        if joined_left==joined_right:return True
+        # 允许一侧多/少一个纯小数点的“半数字”（5 与 5.5）。
+        shorter,longer=(joined_left,joined_right) if len(joined_left)<len(joined_right) else (joined_right,joined_left)
+        return longer.startswith(shorter) and set(longer[len(shorter):])<={'.'}
+
+    @staticmethod
+    def _body_of(value):
+        """去掉单位与符号后的数字本体。"""
+        import re
+        return re.sub(r'(?:%|[万亿千百]|[KMBT])$','',value.lstrip('+-'))
+
+    @staticmethod
+    def _marks(values):
+        """单位与符号的拼接串：语义标记，任何变化都算篡改。"""
+        import re
+        marks=[]
+        for value in values:
+            unit=re.search(r'(?:%|[万亿千百]|[KMBT])$',value)
+            sign='-' if value.startswith('-') else ('+' if value.startswith('+') else '')
+            marks.append(sign+(unit.group() if unit else ''))
+        return ''.join(marks)
 
     @staticmethod
     def correction_numbers(text):
@@ -185,6 +271,9 @@ class ContentPipeline:
             return str(digits[token])
         # 不把“一致”等普通词里的汉字当成数值，也不猜测复杂中文数字。
         text=re.sub(r'(?<![零〇一二两三四五六七八九十百千万亿])(?:[一二两三四五六七八九]?十[一二三四五六七八九]?|[零〇一二两三四五六七八九])(?=[万亿千百年月日天个次倍半%])',chinese,text)
+        # 口语里的“5点5”“3点1”就是小数：不归一的话会被切成两个独立数字，
+        # 模型还原成 3.1 时反而被判成篡改数字（实测 oppas5点5 → Opus 5.5）。
+        text=re.sub(r'(?<=\d)[点·](?=\d)', '.', text)
         number=r'\d+(?:[.,]\d+)*(?:%|[万亿千百]|[KMBT](?![A-Z]))?'
         return re.findall(r'(?<![A-Z0-9])[+-]?'+number+'|'+number,text.upper())
 
@@ -222,6 +311,9 @@ class ContentPipeline:
         folder=self.folder(state)
         path=folder/'corrected.txt'
         if task['kind']!='bili' or not self.settings.pipeline_correction:
+            # 纠错只对 ASR 转写稿有意义：RSS 拿到的是已发布的文字，模型没有
+            # 可校的东西，还会凭空改写专名。这里直接跳过，也不写 correct
+            # 事件——事件日志里不该出现一个没真正执行的阶段。
             log(f'任务 {task["id"]}：无需校对，使用原始正文')
             self.store.update(task['id'],corrected_path=state['raw_path'])
             return {'corrected_path':state['raw_path']}
@@ -252,6 +344,8 @@ class ContentPipeline:
             parts=[]
             offset=0
             failed_chunks=0
+            rejected=[]
+            call_failures=[]
             for index,chunk in enumerate(chunks):
                 data={'video_title':task['title'][:context],
                       'context_before':text[max(0,offset-context):offset],
@@ -263,14 +357,30 @@ class ContentPipeline:
                     try:
                         self.report('correct',f'校对第 {index+1}/{len(chunks)} 段',index+1,len(chunks))
                         log(f'任务 {task["id"]}：请求云端纠错，第 {index+1}/{len(chunks)} 段')
-                        result=self.validate_confirmed(chunk,self.llm.call(self.prompt('correct'),json.dumps(data,ensure_ascii=False)),terms)
+                        # 失败原因必须分开记：调用失败（网络/额度）与校验不过
+                        # （模型改动了数字或漏正文）是两种完全不同的事，
+                        # 混成一句“纠错失败”会让人误以为服务出问题了。
+                        reply=self.llm.call(self.prompt('correct'),json.dumps(data,ensure_ascii=False))
+                        try:
+                            result=self.validate_confirmed(chunk,reply,terms)
+                        except ValueError:
+                            # 只记“哪一类校验没过”，不回显异常消息：消息里可能
+                            # 带原文片段，而原文可能含凭据。原因词是固定枚举。
+                            reason=CorrectionRejected.reason_of(
+                                chunk,reply,self.settings.correction_min_length_ratio)
+                            rejected.append(reason)
+                            raise CorrectionRejected(reason) from None
                         write_text(part_path,result)
-                    except Exception:
+                    except Exception as exc:
                         failed_chunks+=1
+                        if not isinstance(exc,CorrectionRejected):
+                            call_failures.append(type(exc).__name__)
                         separator='' if not index or (text[offset-1].isalnum() and chunk[0].isalnum()) else '\n'
                         parts.append(separator+chunk)
                         offset+=len(chunk)
-                        log(f'任务 {task["id"]}：本段纠错未通过，仅保留本段输入')
+                        # 日志同样只写异常类型与固定原因词，不写异常消息。
+                        log(f'任务 {task["id"]}：本段纠错未采用'
+                            f'（{exc if isinstance(exc,CorrectionRejected) else type(exc).__name__}），仅保留本段输入')
                         continue
                 else:self.report('correct',f'复用校对第 {index+1}/{len(chunks)} 段',index+1,len(chunks))
                 separator='' if not index or (text[offset-1].isalnum() and chunk[0].isalnum()) else '\n'
@@ -285,7 +395,15 @@ class ContentPipeline:
             warning=''
             if failed_chunks:
                 fallback='转写及已确认术语' if text!=original else '原始转写'
-                failure=f'纠错失败，使用{fallback}生成摘要' if failed_chunks==len(chunks) else f'纠错部分失败，{failed_chunks} 段使用{fallback}'
+                # 三种原因分开说：调用失败、内容未通过校验、两者都有。
+                reasons=[]
+                if call_failures:
+                    reasons.append(f'调用失败 {len(call_failures)} 段（{call_failures[0]}）')
+                if rejected:
+                    reasons.append(f'未通过校验 {len(rejected)} 段（{rejected[0]}）')
+                detail='、'.join(reasons) if reasons else '原因未知'
+                scope='' if failed_chunks==len(chunks) else f'部分（{failed_chunks}/{len(chunks)} 段）'
+                failure=f'纠错{scope}未采用，{detail}，已改用{fallback}'
                 warning='；'.join(value for value in (failure,warning) if value)
             if uncertain:
                 warning=('；'.join(value for value in (warning,f'纠错稿含 {uncertain} 处待核词，请对照音频确认') if value))
@@ -320,16 +438,21 @@ class ContentPipeline:
                 if not part.exists():
                     self.report('summarize',f'摘要第 {index+1}/{len(chunks)} 段',index+1,len(chunks))
                     log(f'任务 {state["task_id"]}：请求云端摘要，第 {index+1}/{len(chunks)} 段')
-                    result=self.parse_summary(self.llm.call(self.prompt('summarize'),chunk,True),require_title=True)
-                    write_text(part,json.dumps(result,ensure_ascii=False))
+                    # 正文抽取会丢掉逐条链接（trafilatura 只保留文字），所以把
+                    # 材料里的链接清单单独附在正文后面：模型看得到才挑得出，
+                    # 但仍只能用白名单里的地址，编造的会被丢弃。
+                    allowed=self.material_urls(self.folder(state),chunk)
+                    material=self.with_link_list(chunk,allowed)
+                    events=self.parse_summary(self.llm.call(self.prompt('summarize'),material,True),
+                                              require_title=True,topics=self.settings.topic_order,
+                                              allowed_urls=allowed)
+                    write_text(part,json.dumps({'events':events},ensure_ascii=False))
                 else:self.report('summarize',f'复用摘要第 {index+1}/{len(chunks)} 段',index+1,len(chunks))
-                partials.append(json.loads(read_text(part)))
-            if len(partials)==1:result=partials[0]
-            else:
-                self.report('summarize',f'汇总 {len(partials)} 段摘要',len(partials),len(partials))
-                log(f'任务 {state["task_id"]}：汇总 {len(partials)} 段摘要')
-                result=self.parse_summary(self.llm.call(self.prompt('summarize'),json.dumps(partials,ensure_ascii=False),True),require_title=True)
-            write_text(path,json.dumps(result,ensure_ascii=False))
+                partials.extend(self.parse_summary(read_text(part),topics=self.settings.topic_order))
+            # 分片结果直接拼接即可：每片已经按事件拆好，再让模型合并一次反而
+            # 会把它压回单条，等于把刚拆开的粒度又揉回去。
+            events=self.merge_partials(partials)
+            write_text(path,json.dumps({'events':events},ensure_ascii=False))
             write_text(manifest,json.dumps({'fingerprint':fingerprint}))
         else:
             self.report('summarize','复用已有摘要')
@@ -338,33 +461,120 @@ class ContentPipeline:
         return {'summary_path':str(path)}
 
     @staticmethod
-    def parse_summary(text,require_title=False):
-        """校验摘要JSON。
+    def with_link_list(text,urls,limit=80):
+        """把材料里的链接清单附在正文后，供模型为每条事件挑原文地址。
 
-        标题只在解析新模型输出时强制：磁盘上的历史摘要没有该字段，
-        复核已有产物时若一并要求标题，会把它们判为损坏并触发重算。
+        正文抽取只保留文字，逐条链接会被丢掉；不补这份清单，模型永远挑不出
+        链接，链接回填就是空转。只列前 limit 条，避免把上下文撑爆。
         """
-        result=json.loads(text)
-        if not isinstance(result,dict) or result.get('topic') not in TOPIC_ORDER:
-            raise ValueError('摘要主题无效')
-        bullets=result.get('bullets')
-        if not isinstance(bullets,list) or not 1<=len(bullets)<=64 or any(not isinstance(b,str) or not b.strip() or len(b)>500 for b in bullets):
-            raise ValueError('摘要要点无效')
-        parsed={'topic':result['topic'],'bullets':bullets}
-        title=result.get('title')
-        if isinstance(title,str):
-            title=title.strip()
-            if 1<=len(title)<=40 and '\n' not in title and '\r' not in title:
-                parsed['title']=title
+        if not urls:return text
+        links=sorted(urls)[:limit]
+        return text+'\n\n【材料中出现过的链接，供挑选】\n'+'\n'.join(links)
+
+    @staticmethod
+    def material_urls(folder,text):
+        """材料里真实出现过的链接集合，供摘要链接白名单与校验共用。"""
+        urls=set()
+        for candidate in (text,):
+            if not isinstance(candidate,str):continue
+            for url in re.findall(r'https?://[^\s<>"\')]+',candidate):
+                urls.add(url.rstrip('.,;'))
+        # 结构化正文（feed.txt）里逐条链接最全，正文抽取后常常已经丢掉它们。
+        for name in ('feed.txt','raw.txt'):
+            path=folder/name
+            try:
+                if path.exists():
+                    for url in re.findall(r'https?://[^\s<>"\')]+',read_text(path)):
+                        urls.add(url.rstrip('.,;'))
+            except OSError:
+                continue
+        return urls
+
+    @staticmethod
+    def merge_partials(partials):
+        """拼接分片事件；同一事件跨片重复时按 subject 归并要点。"""
+        merged=[]
+        index={}
+        for event in partials:
+            if not isinstance(event,dict):continue
+            key=event.get('subject')
+            if key and key in index:
+                target=index[key]
+                known=set(target['bullets'])
+                target['bullets'].extend(b for b in event.get('bullets',[]) if b not in known)
+                target['bullets']=target['bullets'][:64]
+                if not target.get('url') and event.get('url'):target['url']=event['url']
+                continue
+            copy=dict(event)
+            merged.append(copy)
+            if key:index[key]=copy
+        return merged[:ContentPipeline.EVENT_MAX]
+
+    EVENT_MAX=40
+    BULLETS_MAX=6
+
+    @classmethod
+    def parse_summary(cls,text,require_title=False,topics=None,allowed_urls=None):
+        """校验摘要 JSON，返回事件数组。
+
+        一条来源可能是单篇文章，也可能是汇总多家新闻的日报。旧结构（单条
+        dict）仍然接受并包成单元素数组，历史摘要因此不需要重算；新结构
+        要求模型按事件拆条，粒度才对得上分节、标题与检索。
+
+        链接走白名单：只接受材料里逐字出现过的 URL，模型编造的链接一律丢弃
+        并退回空值，由发布层补来源主链接。这样“每条事件可点进原文”不会变成
+        “每条事件可能指向幻觉链接”。
+        """
+        payload=json.loads(text)
+        order=topic_order(topics)
+        # 接口的 json_object 模式要求顶层是对象，所以事件装在 events 里；
+        # 兼容三种历史形态：{events:[...]}、裸数组、单条 dict。
+        if isinstance(payload,dict) and isinstance(payload.get('events'),list):
+            items=payload['events']
+        elif isinstance(payload,list):
+            items=payload
+        else:
+            items=[payload]
+        if not items or len(items)>cls.EVENT_MAX:
+            raise ValueError('摘要事件数量无效')
+        events=[]
+        for item in items:
+            if not isinstance(item,dict) or item.get('topic') not in order:
+                raise ValueError('摘要主题无效')
+            bullets=item.get('bullets')
+            if (not isinstance(bullets,list) or not 1<=len(bullets)<=64
+                    or any(not isinstance(b,str) or not b.strip() or len(b)>500 for b in bullets)):
+                raise ValueError('摘要要点无效')
+            event={'topic':item['topic'],'bullets':bullets}
+            title=item.get('title')
+            if isinstance(title,str):
+                title=title.strip()
+                if 1<=len(title)<=40 and '\n' not in title and '\r' not in title:
+                    event['title']=title
+                elif require_title:
+                    raise ValueError('摘要标题无效')
             elif require_title:
                 raise ValueError('摘要标题无效')
-        elif require_title:
-            raise ValueError('摘要标题无效')
-        return parsed
+            url=item.get('url')
+            if isinstance(url,str):
+                url=url.strip()
+                # 白名单为空表示调用方不做校验（复核旧产物），此时保留原值。
+                if allowed_urls is None:
+                    if url.startswith(('http://','https://')) and len(url)<=2048:event['url']=url
+                elif url in allowed_urls:
+                    event['url']=url
+            subject=item.get('subject')
+            if isinstance(subject,str):
+                subject=subject.strip()
+                if 2<=len(subject)<=24 and '\n' not in subject:event['subject']=subject
+            events.append(event)
+        return events
 
     def summary_fingerprint(self,input_path):
         # version 3：摘要开始带模型标题，旧缓存的要点文本仍可用但与新输出不同源，必须重建。
-        material={'input':read_text(input_path),'prompt':self.prompt('summarize'),'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),'chunk_chars':self.settings.get('llm','chunk_chars',12000),'version':3}
+        material={'input':read_text(input_path),'prompt':self.prompt('summarize'),'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),'chunk_chars':self.settings.get('llm','chunk_chars',12000),
+                      'max_tokens':self.settings.get('llm','max_tokens',32000),
+                      'topics':list(self.settings.topic_order),'version':5}
         return hashlib.sha256(json.dumps(material,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
     def summary_current(self,input_path,manifest):
@@ -373,7 +583,8 @@ class ContentPipeline:
 
     def finish(self,state):
         self.report('finish','校验并保存摘要')
-        self.parse_summary(read_text(state['summary_path']))
+        self.parse_summary(read_text(state['summary_path']),topics=self.settings.topic_order,
+                           allowed_urls=None)
         self.store.update(state['task_id'],status='done',error='')
         return {}
 
@@ -418,7 +629,7 @@ class ContentPipeline:
             try:
                 text=read_text(path)
                 if not text.strip():raise ValueError('empty')
-                if path.suffix=='.json':self.parse_summary(text)
+                if path.suffix=='.json':self.parse_summary(text,topics=self.settings.topic_order)
             except (OSError,ValueError,UnicodeError):path.unlink(missing_ok=True)
         required=['raw.txt','summary.json']
         if task['kind']=='bili' and self.settings.pipeline_correction:required.append('corrected.txt')

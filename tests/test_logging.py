@@ -28,7 +28,7 @@ class LoggingTests(unittest.TestCase):
             task=service.store.claim()
             write_text(settings.content_dir/str(task['id'])/'raw.txt','private-transcript')
             pipeline=ContentPipeline(settings,service.store)
-            pipeline.llm.call=Mock(return_value=json.dumps({'topic':'技术','title':'日志标题','bullets':['test']}))
+            pipeline.llm.call=Mock(return_value=json.dumps({'events':[{'topic':'AI 与大模型','title':'日志标题','bullets':['test']}]},ensure_ascii=False))
             output=io.StringIO()
             with redirect_stdout(output):
                 pipeline.run(task);service.publish(task['day'])

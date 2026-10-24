@@ -11,12 +11,27 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
+from orchestration.status import DEFAULT_TOPIC_ORDER
 
 ROOT = Path(__file__).resolve().parent
 APP_ROOT = Path(sys.executable).resolve().parent.parent if getattr(sys, 'frozen', False) else ROOT
+DEFAULT_ASR_ENDPOINT = 'https://api.siliconflow.cn/v1/audio/transcriptions'
+# 单次模型输出上限。默认值按“思考 token 先占额度”实测标定：纠错单次思考
+# 最高约 17000，旧值 16000 会在正文写出前就被耗尽，表现为返回空内容。
+DEFAULT_MAX_TOKENS = 32000
 BILI_AUTO_REFRESH = True
 BILI_REFRESH_CHECK_SECONDS = 86400
 BILI_REFRESH_RETRY_SECONDS = 3600
+
+
+def parse_https_url(name,value):
+    """接口地址统一校验：必须https、有主机名、不带内嵌凭据。"""
+    if not isinstance(value,str) or not value.strip():
+        raise ValueError(f'配置 {name} 必须是非空HTTPS地址')
+    parts=urlsplit(value)
+    if parts.scheme!='https' or not parts.hostname or parts.username or parts.password:
+        raise ValueError(f'配置 {name} 必须是使用无内嵌凭据的HTTPS地址')
+    return value
 
 
 def parse_llm_config(values):
@@ -24,12 +39,7 @@ def parse_llm_config(values):
     section=values.get('llm',{})
     if not isinstance(section,dict):
         raise ValueError('配置 [llm] 必须是表')
-    base_url=section.get('base_url','')
-    if not isinstance(base_url,str) or not base_url.strip():
-        raise ValueError('配置 llm.base_url 必须是非空HTTPS地址')
-    parts=urlsplit(base_url)
-    if parts.scheme!='https' or not parts.hostname or parts.username or parts.password:
-        raise ValueError('配置 llm.base_url 必须是使用无内嵌凭据的HTTPS地址')
+    base_url=parse_https_url('llm.base_url',section.get('base_url',''))
     model=section.get('model','')
     if not isinstance(model,str) or not model.strip():
         raise ValueError('配置 llm.model 必须是非空字符串')
@@ -42,11 +52,16 @@ def parse_llm_config(values):
     thinking_disabled=section.get('thinking_disabled',True)
     if not isinstance(thinking_disabled,bool):
         raise ValueError('配置 llm.thinking_disabled 必须是布尔值')
+    # 单次输出上限。拆条后一次要返回十几到几十个事件，而思考 token 会先吃掉
+    # 这部分额度（实测纠错单次思考可达 17000），额度不足会返回空内容。
+    max_tokens=section.get('max_tokens',DEFAULT_MAX_TOKENS)
+    if not isinstance(max_tokens,int) or isinstance(max_tokens,bool) or not 1000<=max_tokens<=128000:
+        raise ValueError('配置 llm.max_tokens 超出支持范围')
     api_key=section.get('api_key','')
     if not isinstance(api_key,str):
         raise ValueError('配置 llm.api_key 必须是字符串')
     return {'base_url':base_url,'model':model,'timeout':timeout,'chunk_chars':chunk_chars,
-            'thinking_disabled':thinking_disabled,'api_key':api_key}
+            'thinking_disabled':thinking_disabled,'max_tokens':max_tokens,'api_key':api_key}
 
 @dataclass
 class Settings:
@@ -67,13 +82,12 @@ class Settings:
         llm_key_explicit=self.llm_key is not None
         self.site_name=self.get('site','name','鸦闻 · 每日简报')
         if not isinstance(self.site_name,str) or not self.site_name.strip():raise ValueError('配置 site.name 必须是非空字符串')
-        # 站点地址可为空：为空时页面不输出 canonical/导航链接，而不是整站500。
+        # 站点地址可为空：为空时页面不输出 canonical，而不是整站500。
+        # site.nav_url 已废弃：页头不再提供“返回导航”，旧配置里残留该键也不会报错。
         self.site_public_url=self.get('site','public_url','') or ''
-        self.site_nav_url=self.get('site','nav_url','') or ''
-        for key,value in [('public_url',self.site_public_url),('nav_url',self.site_nav_url)]:
-            if not isinstance(value,str):raise ValueError(f'配置 site.{key} 必须是字符串')
-            if value and not (value.startswith('https://') or value.startswith('http://')):
-                raise ValueError(f'配置 site.{key} 必须是HTTP(S)地址')
+        if not isinstance(self.site_public_url,str):raise ValueError('配置 site.public_url 必须是字符串')
+        if self.site_public_url and not self.site_public_url.startswith(('https://','http://')):
+            raise ValueError('配置 site.public_url 必须是HTTP(S)地址')
         for attribute,env,section,key in [('asr_key','SILICONFLOW_API_KEY','asr','api_key'),('llm_key','LLM_BRAIN_API_KEY','llm','api_key'),('admin_hash','ADMIN_PASSWORD_HASH','security','password_hash'),('session_secret','SESSION_SECRET','security','session_secret'),('cookie_file','BILI_COOKIE_FILE','bili','cookie_file')]:
             if getattr(self,attribute) is None:
                 value=os.getenv(env) or self.get(section,key,'')
@@ -136,8 +150,14 @@ class Settings:
                 raise ValueError(f'配置 {section}.{key} 超出支持范围')
         llm=parse_llm_config(self.values)
         self.llm_base_url=llm['base_url']
+        self.llm_max_tokens=llm['max_tokens']
         value=self.get('asr','model','')
         if not isinstance(value,str) or not value.strip():raise ValueError('配置 asr.model 必须是非空字符串')
+        raw_url=self.get('asr','base_url','')
+        if raw_url is None:raw_url=''
+        if not isinstance(raw_url,str):raise ValueError('配置 asr.base_url 必须是非空HTTPS地址')
+        # 留空表示使用默认地址，避免旧配置升级后因为缺键而拒绝启动。
+        self.asr_base_url=parse_https_url('asr.base_url',raw_url.strip() or DEFAULT_ASR_ENDPOINT)
         for key,default,minimum,maximum in [('chunk_chars',4000,1000,8000),('context_chars',600,0,2000)]:
             value=self.get('correction',key,default)
             if type(value) is not int or not minimum<=value<=maximum:raise ValueError(f'配置 correction.{key} 超出支持范围')
@@ -183,6 +203,19 @@ class Settings:
         if not isinstance(self.report_retention_days,int) or isinstance(self.report_retention_days,bool) \
                 or not 0<=self.report_retention_days<=36500:
             raise ValueError('配置 storage.report_days 超出支持范围')
+        # 主题词表可配置：末项是兜底项，模型输出不在词表内时归到这里。
+        raw_topics=self.get('topics','order',None)
+        if raw_topics is None or raw_topics==[]:
+            self.topic_order=DEFAULT_TOPIC_ORDER
+        else:
+            if not isinstance(raw_topics,list) or not 2<=len(raw_topics)<=20:
+                raise ValueError('配置 topics.order 必须是2到20项的主题列表')
+            for name in raw_topics:
+                if not isinstance(name,str) or not name.strip() or len(name)>12:
+                    raise ValueError('配置 topics.order 的每一项必须是1至12字的非空字符串')
+            if len(set(raw_topics))!=len(raw_topics):
+                raise ValueError('配置 topics.order 不能有重复主题')
+            self.topic_order=tuple(raw_topics)
         self.content_dir = self.data_dir / 'content'
         self.cache_dir = self.data_dir / 'cache'
         for p in (self.data_dir, self.content_dir, self.cache_dir):
@@ -227,6 +260,7 @@ class Settings:
                 self.values['llm']=values.get('llm',{})
                 self.llm_key=key
                 self.llm_base_url=llm['base_url']
+                self.llm_max_tokens=llm['max_tokens']
                 self.llm_revision+=1
                 self.llm_reloaded_at=time.time()
                 self.llm_reload_error=''
@@ -248,4 +282,5 @@ class Settings:
             return {'model':model,'host':urlsplit(self.llm_base_url).hostname or '',
                     'revision':self.llm_revision,'reloaded_at':self.llm_reloaded_at,
                     'error':self.llm_reload_error,'configured':bool(self.llm_key),
+                    'max_tokens':getattr(self,'llm_max_tokens',DEFAULT_MAX_TOKENS),
                     'pending':self._config_stamp()!=self._llm_stamp}

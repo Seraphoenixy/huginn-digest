@@ -31,7 +31,7 @@ class StorageUsageTests(unittest.TestCase):
         write_text(folder/'raw.txt','A'*1000)
         write_text(folder/'corrected.txt','B'*1000)
         write_text(folder/'part_1.txt','C'*500)
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['x']}))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['x']}))
         write_text(self.settings.cache_dir/'downloads'/'a.bin','D'*300)
         write_text(self.settings.data_dir/'reports'/'2026-01-01'/'v.json','E'*200)
         usage=disk_usage(self.settings)
@@ -79,7 +79,7 @@ class AdminPanelTests(unittest.TestCase):
         task=self.service.store.query('SELECT * FROM tasks')[0]
         folder=self.settings.content_dir/str(task['id'])
         write_text(folder/'raw.txt','转写'*2000)
-        write_text(folder/'summary.json',json.dumps({'topic':'技术','bullets':['要点']},ensure_ascii=False))
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['要点']},ensure_ascii=False))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'),
                                   raw_path=str(folder/'raw.txt'))
         self.task_id=task['id']
@@ -93,9 +93,9 @@ class AdminPanelTests(unittest.TestCase):
     def test_asr_state_is_visible_again(self):
         """回归：ASR 配置状态在改版时从模板里丢失。"""
         page=self.client.get('/admin').text
-        self.assertIn('ASR',page)
+        self.assertIn('转写',page)
         # 夹具未配置 asr_key
-        self.assertIn('未配置 ASR',page)
+        self.assertIn('未配置转写 Key',page)
 
     def test_asr_warning_disappears_when_configured(self):
         settings=Settings(data_dir=Path(self.directory.name)/'configured',
@@ -106,17 +106,29 @@ class AdminPanelTests(unittest.TestCase):
         with TestClient(app) as client:
             client.cookies.set('daily_session',app.state.service.new_session(True))
             page=client.get('/admin').text
-            self.assertNotIn('未配置 ASR',page)
-            self.assertIn('ASR已配置',page)
+            self.assertNotIn('未配置转写 Key',page)
+            self.assertIn('转写已配置',page)
 
-    def test_storage_card_shows_retention_and_usage(self):
+    def test_storage_card_shows_every_bucket_so_the_total_adds_up(self):
+        """回归：漏掉 other 分类时，各行相加凑不出合计。"""
         page=self.client.get('/admin').text
-        for text in ('存储与保留','数据目录占用','转写原文','摘要与快照','下次自动清理','保留期：'):
+        for text in ('存储与保留','合计','转写原文','摘要与快照','已发布日报','下载缓存',
+                     '数据库','其他文件','下次自动清理','保留期：'):
             self.assertIn(text,page)
         self.assertIn('日报 1095 天',page)
-        match=re.search(r'数据目录占用</dt><dd>([\d.]+) MB',page)
+        match=re.search(r'合计</span><span class="settings-row__value">([\d.]+) MB',page)
         self.assertIsNotNone(match)
         self.assertGreater(float(match[1]),0)
+
+    def test_bucket_sum_equals_total(self):
+        folder=self.settings.content_dir/'9'
+        write_text(folder/'raw.txt','A'*1000)
+        write_text(folder/'summary.json',json.dumps({'topic':'AI 与大模型','bullets':['x']}))
+        write_text(self.settings.data_dir/'stray.png','P'*700)
+        usage=disk_usage(self.settings)
+        self.assertEqual(usage['buckets']['other'],700,'根目录下的非归类文件必须计入 other')
+        self.assertEqual(usage['total'],sum(usage['buckets'].values()),
+                         '合计必须等于各分类之和，页面才不会出现缺口')
 
     def test_retraction_reason_is_visible(self):
         token=self.token()
