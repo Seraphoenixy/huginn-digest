@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 # 转写类中间产物：体积最大、只在重建时需要，且日报展示完全不依赖它们。
-TRANSCRIPT_NAMES=('raw.txt','corrected.txt','feed.txt','correction_manifest.json')
+TRANSCRIPT_NAMES=('raw.txt','corrected.txt','feed.txt','video_description.txt','correction_manifest.json')
 TRANSCRIPT_GLOBS=('part_*.txt','correction_*.txt','previous_correction_*')
 
 

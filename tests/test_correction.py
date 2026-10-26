@@ -29,6 +29,7 @@ class CorrectionTests(unittest.TestCase):
         self.raw=self.folder/'raw.txt'
         self.original='Kit Hub 提供代码托管功能。Workbody 支持开发任务，版本为 2.1，可能需要登录。'
         write_text(self.raw,self.original)
+        write_text(self.folder/'video_description.txt','GitHub 与 WorkBuddy 官方介绍 https://example.com/project')
         self.state['raw_path']=str(self.raw)
 
     def identity_model(self,system,payload,*args):
@@ -41,6 +42,33 @@ class CorrectionTests(unittest.TestCase):
     def manifest(self):
         return json.loads(read_text(self.folder/'correction_manifest.json'))
 
+    def test_description_changes_invalidate_both_model_caches(self):
+        self.pipeline.llm.call=Mock(side_effect=self.identity_model)
+        self.correct()
+        before=self.pipeline.summary_fingerprint(self.raw)
+        write_text(self.folder/'video_description.txt','更新后的简介')
+        self.assertFalse(self.pipeline.correction_current(self.raw,self.task))
+        self.assertNotEqual(before,self.pipeline.summary_fingerprint(self.raw))
+
+    def test_summary_receives_description_and_its_link(self):
+        self.state['corrected_path']=str(self.raw)
+        self.pipeline.llm.call=Mock(return_value=json.dumps({'topic':'开发与开源','title':'项目介绍','bullets':['项目介绍'],'url':'https://example.com/project'}))
+        result=self.pipeline.summarize(self.state)
+        payload=self.pipeline.llm.call.call_args.args[1]
+        self.assertIn('GitHub 与 WorkBuddy 官方介绍',payload)
+        self.assertIn(self.original,payload)
+        self.assertIn('https://example.com/project',read_text(result['summary_path']))
+
+    def test_acquire_backfills_description_without_downloading(self):
+        from unittest.mock import patch
+        (self.folder/'video_description.txt').unlink()
+        with patch('orchestration.pipeline.BiliVideoSource') as source:
+            source.return_value.get_video_info.return_value={'desc':'简介补取','pages':[]}
+            self.pipeline.acquire(self.state)
+            source.return_value.download_media.assert_not_called()
+            self.assertEqual(read_text(self.raw),self.original)
+            self.assertEqual(read_text(self.folder/'video_description.txt'),'简介补取')
+
     def test_single_pass_receives_original_and_video_context(self):
         final=self.original.replace('Kit Hub','GitHub').replace('Workbody','WorkBuddy')
         self.pipeline.llm.call=Mock(return_value=final)
@@ -51,6 +79,7 @@ class CorrectionTests(unittest.TestCase):
         initial=json.loads(self.pipeline.llm.call.call_args.args[1])
         self.assertEqual(initial['text'],self.original)
         self.assertEqual(initial['video_title'],self.task['title'])
+        self.assertIn('GitHub',initial['video_description'])
         self.assertTrue(self.manifest()['complete'])
         self.assertNotIn(self.original,read_text(self.folder/'correction_manifest.json'))
 
