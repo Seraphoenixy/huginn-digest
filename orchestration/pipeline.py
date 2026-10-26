@@ -12,6 +12,7 @@ from integration.sources.bili import BiliVideoSource, extract_bvid_from_url
 from integration.sources.rss import extract
 from model.asr import CloudASR
 from model.text import TextModel
+from integration.http.llm import CloudError
 from integration.runtime_log import log
 from orchestration.terminology import apply_terms,check_terms,term_pattern
 from orchestration.status import STAGE_LOG_LABELS, stage_label, topic_order, topic_name
@@ -201,7 +202,7 @@ class ContentPipeline:
                   'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),
                   'chunk_chars':self.settings.get('correction','chunk_chars',4000),'context_chars':context,
                   'min_length_ratio':self.settings.correction_min_length_ratio,'terms':terms,
-                  'max_tokens':self.settings.get('llm','max_tokens',32000),'version':4}
+                  'max_tokens':self.settings.get('llm','max_tokens',32000),'version':5}
         return hashlib.sha256(json.dumps(material,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
     def validate_correction(self,original,result):
@@ -284,6 +285,25 @@ class ContentPipeline:
         check_terms(original,result,terms)
         return result
 
+    def salvage_correction(self,original,reply,terms):
+        """仅保留独立句中通过校验的修正；边界变化时不猜测句子对应。"""
+        if not isinstance(reply,str):return None
+        split=lambda text:re.split(r'(?<=[。！？!?；;])',text)
+        before,after=split(original),split(reply)
+        if len(before)!=len(after):return None
+        parts=[]
+        for source,target in zip(before,after):
+            if not source.strip():
+                if target.strip():return None
+                parts.append(source)
+                continue
+            try:parts.append(self.validate_confirmed(source,target,terms))
+            except ValueError:parts.append(source)
+        result=''.join(parts)
+        if result==original:return None
+        try:return self.validate_confirmed(original,result,terms)
+        except ValueError:return None
+
     def correction_part(self,path,original,terms=()):
         try:return self.validate_confirmed(original,read_text(path),terms)
         except (OSError,ValueError,UnicodeError):return None
@@ -303,7 +323,7 @@ class ContentPipeline:
 
     def correction_warning(self,task_id,message):
         previous=self.store.task(task_id)['warning']
-        if previous.startswith(('纠错失败','纠错部分失败','专名复核失败','纠错稿含')):previous=''
+        if previous.startswith(('纠错','校对','专名复核失败')):previous=''
         self.store.update(task_id,warning='；'.join(value for value in (previous,message) if value))
 
     def correct(self,state):
@@ -346,6 +366,7 @@ class ContentPipeline:
             failed_chunks=0
             rejected=[]
             call_failures=[]
+            salvaged=0
             for index,chunk in enumerate(chunks):
                 data={'video_title':task['title'][:context],
                       'context_before':text[max(0,offset-context):offset],
@@ -364,17 +385,20 @@ class ContentPipeline:
                         try:
                             result=self.validate_confirmed(chunk,reply,terms)
                         except ValueError:
-                            # 只记“哪一类校验没过”，不回显异常消息：消息里可能
-                            # 带原文片段，而原文可能含凭据。原因词是固定枚举。
-                            reason=CorrectionRejected.reason_of(
-                                chunk,reply,self.settings.correction_min_length_ratio)
-                            rejected.append(reason)
-                            raise CorrectionRejected(reason) from None
+                            result=self.salvage_correction(chunk,reply,terms)
+                            if result is not None:
+                                salvaged+=1
+                            else:
+                                # 原因词是固定枚举，不回显可能含凭据的异常消息。
+                                reason=CorrectionRejected.reason_of(
+                                    chunk,reply,self.settings.correction_min_length_ratio)
+                                rejected.append(reason)
+                                raise CorrectionRejected(reason) from None
                         write_text(part_path,result)
                     except Exception as exc:
                         failed_chunks+=1
                         if not isinstance(exc,CorrectionRejected):
-                            call_failures.append(type(exc).__name__)
+                            call_failures.append(exc.public_reason if isinstance(exc,CloudError) else type(exc).__name__)
                         separator='' if not index or (text[offset-1].isalnum() and chunk[0].isalnum()) else '\n'
                         parts.append(separator+chunk)
                         offset+=len(chunk)
@@ -393,6 +417,8 @@ class ContentPipeline:
                                           'output_sha256':hashlib.sha256(result.encode()).hexdigest()}))
             uncertain=result.count('【待核】')
             warning=''
+            if salvaged:
+                warning=f'校对 {salvaged} 段仅采用通过校验的句子，其余句子保留原始转写'
             if failed_chunks:
                 fallback='转写及已确认术语' if text!=original else '原始转写'
                 # 三种原因分开说：调用失败、内容未通过校验、两者都有。

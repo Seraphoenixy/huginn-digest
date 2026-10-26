@@ -4,7 +4,17 @@ import requests
 from urllib.parse import urlsplit
 
 class CloudError(RuntimeError):
-    pass
+    @property
+    def public_reason(self):
+        # Only fixed messages produced here may reach task warnings.
+        message=str(self)
+        known={'缺少 LLM_BRAIN_API_KEY':'缺少模型凭据','LLM输出被截断':'输出被截断',
+               'LLM输出为空':'输出为空','LLM网络请求失败':'网络连接失败',
+               '模型接口必须使用无内嵌凭据的HTTPS地址':'接口地址无效'}
+        if message in known:return known[message]
+        import re
+        if re.fullmatch(r'LLM HTTP [1-5][0-9]{2}',message):return message
+        return '云端模型调用失败'
 
 def complete(settings, messages, *, json_mode=False):
     if not settings.llm_key:

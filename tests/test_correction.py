@@ -111,6 +111,39 @@ class CorrectionTests(unittest.TestCase):
         self.assertNotIn('private-api-secret',output.getvalue()+self.service.store.task(self.task['id'])['warning'])
         self.assertFalse(self.manifest()['complete'])
 
+    def test_numeric_rejection_preserves_independently_valid_sentence(self):
+        original='Kit Hub 提供代码托管。模型版本为 2.1。'
+        write_text(self.raw,original)
+        self.pipeline.llm.call=Mock(return_value='GitHub 提供代码托管。模型版本为 2.2。')
+        result=self.correct()
+        self.assertEqual(read_text(result['corrected_path']),'GitHub 提供代码托管。模型版本为 2.1。')
+        self.assertIn('其余句子保留原始转写',self.service.store.task(self.task['id'])['warning'])
+        self.assertEqual(read_text(self.raw),original)
+
+    def test_cloud_failure_reports_safe_reason(self):
+        from integration.http.llm import CloudError
+        for message,expected in [('LLM HTTP 401','LLM HTTP 401'),
+                                 ('LLM输出被截断','输出被截断'),
+                                 ('private-api-secret','云端模型调用失败')]:
+            self.pipeline.llm.call=Mock(side_effect=CloudError(message))
+            self.correct()
+            warning=self.service.store.task(self.task['id'])['warning']
+            self.assertIn(expected,warning)
+            self.assertNotIn('private-api-secret',warning)
+
+    def test_salvage_rejects_changed_boundaries_and_number_order(self):
+        self.assertIsNone(self.pipeline.salvage_correction(
+            '甲为 2。乙为 3。','甲为 3，乙为 2。',()))
+        self.assertIsNone(self.pipeline.salvage_correction(
+            '甲为 2。乙为 3。','甲为 3。乙为 2。',()))
+
+    def test_successful_retry_clears_previous_failure_warning(self):
+        self.pipeline.llm.call=Mock(side_effect=RuntimeError('offline'))
+        self.correct()
+        self.pipeline.llm.call=Mock(side_effect=self.identity_model)
+        self.correct()
+        self.assertEqual(self.service.store.task(self.task['id'])['warning'],'')
+
     def test_main_switch_ignores_old_output(self):
         self.pipeline.llm.call=Mock(side_effect=self.identity_model)
         self.correct()

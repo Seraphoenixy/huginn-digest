@@ -436,8 +436,18 @@ class DailyService:
             before=len(entries)
             entries=[entry for entry in entries if entry.get('task_id',entry['id']) not in retracted]
             if len(entries)<before:log(f'日报 {day}：{before-len(entries)} 条已撤回条目未包含在本次发布')
-        if len(entries)>len(tasks)-len(broken):
-            log(f'日报 {day}：{len(entries)-(len(tasks)-len(broken))} 条未成功任务沿用上一次成功条目')
+        # 统计沿用了几条历史条目。一个任务可派生多条事件，条目数不再等于任务数，
+        # 所以按任务归属算：本次没有产出的任务，其旧条目才算“沿用”。
+        current_tasks={task['id'] for task in tasks}
+        carried=[]
+        for entry in entries:
+            owner=entry.get('task_id',entry['id'])
+            if isinstance(owner,str) and ':' in owner:owner=owner.split(':',1)[0]
+            try:owner=int(owner)
+            except (TypeError,ValueError):owner=None
+            if owner not in current_tasks:carried.append(entry)
+        if carried:
+            log(f'日报 {day}：{len(carried)} 条未成功任务的条目沿用上一次成功版本')
         if not entries:
             if not allow_empty:
                 # 没有任何可用条目时不发布空日报，保留上一版（若有）。
