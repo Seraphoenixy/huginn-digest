@@ -47,6 +47,7 @@ ERROR_HINTS={
     'ConnectionError':'网络连接失败',
     'TimeoutError':'请求超时',
     'ValueError':'内容或配置校验未通过',
+    'SummaryValidationError':'摘要格式校验未通过，请查看阶段记录中的分段和具体原因',
     'OSError':'文件读写失败',
     'UnicodeError':'文本编码异常',
     'JSONDecodeError':'模型输出不是有效JSON',

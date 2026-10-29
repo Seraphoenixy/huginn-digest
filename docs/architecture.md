@@ -106,3 +106,5 @@ HTTP输入限制由interaction/request_limits.py的ASGI中间件在表单解析�
 来源ID由meta中的source_id_seq单调分配，不再依赖SQLite的INTEGER PRIMARY KEY隐式复用：普通主键在删除最大行号后会复用该号，使旧任务的source_id指向新来源、管理页把旧内容显示为新来源。首次分配时以sources与tasks引用的最大ID为种子，旧库无需迁移即可避免冲突。
 
 文本模型配置热重载的唯一实现为config.py的Settings.refresh_llm与parse_llm_config：[llm]段（model、base_url、api_key、timeout、chunk_chars、thinking_disabled）用文件元数据判断变化，先stat后解析，校验失败保留旧值并记录不含凭据的原因；应用时原子替换values['llm']、llm_key与llm_base_url，并递增llm_revision。显式构造的llm_key与LLM_BRAIN_API_KEY仍优先于文件，与统一优先级一致。DailyService.refresh_config在每轮tick与任务之间应用变更，正在处理任务或重建时只登记待应用，避免同一份摘要的缓存指纹跨模型；管理页POST /admin/config/reload可手动触发，处理中同样登记并显示“有变更待应用”。监听地址、会话密钥、数据目录、来源等其他设置仍只在启动时读取，不会因热加载改变。
+
+摘要格式错误使用 SummaryValidationError（兼容 ValueError）区分 JSON、事件数量、主题、要点及标题校验；云端返回校验失败时附分段序号，字段错误附事件序号。日志与后台阶段记录仅保存固定规则说明和程序计数，不保存模型返回、正文片段或任意异常消息。任务错误类型提示引导管理员查看阶段记录，历史 ValueError 仍按原提示展示。

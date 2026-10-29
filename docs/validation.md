@@ -4,7 +4,7 @@
 
 ## 离线验证
 
-Windows / Python 3.13项目虚拟环境，通过 `DAILY_CONFIG` 指向无凭据的 `config.example.toml`，执行 `python -m unittest discover -s tests -v`，416项通过；`python -m pip check`通过，未调用真实API或加载模型。当前实测包括certifi2026.10.19、AnyIO4.15.1、FastAPI0.159.1、yt-dlp2026.10.21、PyInstaller6.22.3及hooks2026.9。测试数量以实际发现为准。本机旧配置下两项配置相关断言失败（ASR配置提示、缺少transcript_days）；示例配置全量通过，本机配置未修改。逐句校对回退及错误细分未调用真实API。视频简介输入已通过离线验证：纠错和摘要均接收简介、简介链接可引用、简介变化使两类缓存失效、旧转写补取简介时不重新下载；真实B站详情与模型效果尚未实测。
+Windows / Python 3.13项目虚拟环境，通过 `DAILY_CONFIG` 指向无凭据的 `config.example.toml`，执行 `python -m unittest discover -s tests -v`，419项通过；`python -m pip check`通过，未调用真实API或加载模型。当前实测包括certifi2026.10.19、AnyIO4.15.1、FastAPI0.159.1、yt-dlp2026.10.21、PyInstaller6.22.3及hooks2026.9。测试数量以实际发现为准。本机旧配置下两项配置相关断言失败（ASR配置提示、缺少transcript_days）；示例配置全量通过，本机配置未修改。逐句校对回退及错误细分未调用真实API。摘要排故已离线覆盖JSON、事件数量、主题、要点、标题的固定错误原因、事件序号及阶段日志/记录写入，断言不回显敏感样本文本；云端返回校验失败附分段位置。未部署到服务器，旧任务的历史日志无法补回具体原因。视频简介输入已通过离线验证：纠错和摘要均接收简介、简介链接可引用、简介变化使两类缓存失效、旧转写补取简介时不重新下载；真实B站详情与模型效果尚未实测。
 
 certifi维护者公告将2026.10.18列为移除受影响emSign根证书的修复版本，与此前漏洞库给出的2026.10.19边界不一致；不能据版本号认定2026.10.18仍受该问题影响。当前依赖下限采用更新的2026.10.19；来源见[维护者公告](https://github.com/certifi/python-certifi/security/advisories/GHSA-6q48-6c7w-9gw2)。
 

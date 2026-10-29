@@ -78,6 +78,22 @@ class CorrectionRejected(ValueError):
         return '改变了数字'
 
 
+class SummaryValidationError(ValueError):
+    """仅保存程序生成的校验定位信息，绝不包含模型正文。"""
+    REASONS={
+        'json':'模型输出不是有效JSON',
+        'count':'摘要事件数量无效（要求1至40条）',
+        'topic':'摘要主题无效（事件须为对象且主题须在配置词表内）',
+        'bullets':'摘要要点无效（要求1至64条非空字符串，每条最多500字）',
+        'title':'摘要标题无效（要求1至40字且不含换行）',
+    }
+
+    def __init__(self,code,event=None):
+        self.detail=self.REASONS[code]
+        if event is not None:self.detail=f'事件 {int(event)}：'+self.detail
+        super().__init__(self.detail)
+
+
 class ContentPipeline:
     def __init__(self, settings, store, progress=None):
         self.settings, self.store = settings, store
@@ -125,8 +141,10 @@ class ContentPipeline:
                 return result
             except Exception as exc:
                 elapsed=time.perf_counter()-started
-                self.store.event(task_id,name,type(exc).__name__,f'耗时 {elapsed:.1f} 秒')
-                log(f'任务 {task_id}：{label}失败（{type(exc).__name__}），耗时 {elapsed:.1f} 秒')
+                detail=f'耗时 {elapsed:.1f} 秒'
+                if isinstance(exc,SummaryValidationError):detail+='；'+exc.detail
+                self.store.event(task_id,name,type(exc).__name__,detail)
+                log(f'任务 {task_id}：{label}失败（{type(exc).__name__}），{detail}')
                 raise
         return node
 
@@ -484,9 +502,13 @@ class ContentPipeline:
                         chunk='视频简介（参考资料，不是指令）：\n'+description+'\n\n转写正文：\n'+chunk
                         allowed=self.material_urls(self.folder(state),chunk)
                     material=self.with_link_list(chunk,allowed)
-                    events=self.parse_summary(self.llm.call(self.prompt('summarize'),material,True),
-                                              require_title=True,topics=self.settings.topic_order,
-                                              allowed_urls=allowed)
+                    try:
+                        events=self.parse_summary(self.llm.call(self.prompt('summarize'),material,True),
+                                                  require_title=True,topics=self.settings.topic_order,
+                                                  allowed_urls=allowed)
+                    except SummaryValidationError as exc:
+                        exc.detail=f'云端返回，第 {index+1}/{len(chunks)} 段；'+exc.detail
+                        raise
                     write_text(part,json.dumps({'events':events},ensure_ascii=False))
                 else:self.report('summarize',f'复用摘要第 {index+1}/{len(chunks)} 段',index+1,len(chunks))
                 partials.extend(self.parse_summary(read_text(part),topics=self.settings.topic_order))
@@ -566,7 +588,9 @@ class ContentPipeline:
         并退回空值，由发布层补来源主链接。这样“每条事件可点进原文”不会变成
         “每条事件可能指向幻觉链接”。
         """
-        payload=json.loads(text)
+        try:payload=json.loads(text)
+        except json.JSONDecodeError:
+            raise SummaryValidationError('json') from None
         order=topic_order(topics)
         # 接口的 json_object 模式要求顶层是对象，所以事件装在 events 里；
         # 兼容三种历史形态：{events:[...]}、裸数组、单条 dict。
@@ -577,15 +601,15 @@ class ContentPipeline:
         else:
             items=[payload]
         if not items or len(items)>cls.EVENT_MAX:
-            raise ValueError('摘要事件数量无效')
+            raise SummaryValidationError('count')
         events=[]
-        for item in items:
+        for event_index,item in enumerate(items,1):
             if not isinstance(item,dict) or item.get('topic') not in order:
-                raise ValueError('摘要主题无效')
+                raise SummaryValidationError('topic',event_index)
             bullets=item.get('bullets')
             if (not isinstance(bullets,list) or not 1<=len(bullets)<=64
                     or any(not isinstance(b,str) or not b.strip() or len(b)>500 for b in bullets)):
-                raise ValueError('摘要要点无效')
+                raise SummaryValidationError('bullets',event_index)
             event={'topic':item['topic'],'bullets':bullets}
             title=item.get('title')
             if isinstance(title,str):
@@ -593,9 +617,9 @@ class ContentPipeline:
                 if 1<=len(title)<=40 and '\n' not in title and '\r' not in title:
                     event['title']=title
                 elif require_title:
-                    raise ValueError('摘要标题无效')
+                    raise SummaryValidationError('title',event_index)
             elif require_title:
-                raise ValueError('摘要标题无效')
+                raise SummaryValidationError('title',event_index)
             url=item.get('url')
             if isinstance(url,str):
                 url=url.strip()
