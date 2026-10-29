@@ -82,6 +82,7 @@ class SummaryValidationError(ValueError):
     """仅保存程序生成的校验定位信息，绝不包含模型正文。"""
     REASONS={
         'json':'模型输出不是有效JSON',
+        'entity':'单事件摘要未保留视频标题中的唯一复合英文专名，请核对名称',
         'count':'摘要事件数量无效（要求1至40条）',
         'topic':'摘要主题无效（事件须为对象且主题须在配置词表内）',
         'bullets':'摘要要点无效（要求1至64条非空字符串，每条最多500字）',
@@ -230,7 +231,7 @@ class ContentPipeline:
                   'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),
                   'chunk_chars':self.settings.get('correction','chunk_chars',4000),'context_chars':context,
                   'min_length_ratio':self.settings.correction_min_length_ratio,'terms':terms,
-                  'max_tokens':self.settings.get('llm','max_tokens',32000),'version':5}
+                  'max_tokens':self.settings.get('llm','max_tokens',32000),'version':6}
         return hashlib.sha256(json.dumps(material,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
     def validate_correction(self,original,result):
@@ -314,19 +315,45 @@ class ContentPipeline:
         return result
 
     def salvage_correction(self,original,reply,terms):
-        """仅保留独立句中通过校验的修正；边界变化时不猜测句子对应。"""
+        """先逐句恢复；断句变化或整句回退时尝试只撤销数字相关编辑。"""
         if not isinstance(reply,str):return None
         split=lambda text:re.split(r'(?<=[。！？!?；;])',text)
         before,after=split(original),split(reply)
-        if len(before)!=len(after):return None
+        if len(before)==len(after):
+            parts=[]
+            for source,target in zip(before,after):
+                if not source.strip():
+                    parts.append(source)
+                    continue
+                try:parts.append(self.validate_confirmed(source,target,terms))
+                except ValueError:
+                    parts.append(self.salvage_numeric_edits(source,target,terms) or source)
+            result=''.join(parts)
+            if result!=original:
+                try:return self.validate_confirmed(original,result,terms)
+                except ValueError:pass
+        return self.salvage_numeric_edits(original,reply,terms)
+
+    def salvage_numeric_edits(self,original,reply,terms):
+        """高相似文本对齐后恢复数字编辑；不猜测正确数值，不增加模型调用。"""
+        from difflib import SequenceMatcher
+        if not isinstance(reply,str) or not reply.strip() or reply.strip().startswith('```'):return None
+        # 兼容数字书写差异的编辑仍交给原校验器；这里仅用于校验失败后的恢复。
+        reply=apply_terms(reply,terms)
+        matcher=SequenceMatcher(None,original,reply,autojunk=False)
+        if matcher.ratio()<0.65:return None
+        number=re.compile(r'[+＋\-−]?\d+(?:[.,点·]\d+)*(?:[%％万亿千百]|[KkMmBbTt](?![A-Za-z]))?|'
+                          r'[零〇一二两三四五六七八九十百千万亿]+(?=[%％年月日天个次倍半])')
+        left=[m.span() for m in number.finditer(original)]
+        right=[m.span() for m in number.finditer(reply)]
+        def touches(start,end,spans):
+            # 插入/删除恰在数值边缘也会改变符号、单位或位数，必须恢复。
+            return any(start<=b and end>=a for a,b in spans)
         parts=[]
-        for source,target in zip(before,after):
-            if not source.strip():
-                if target.strip():return None
-                parts.append(source)
-                continue
-            try:parts.append(self.validate_confirmed(source,target,terms))
-            except ValueError:parts.append(source)
+        for tag,i,j,k,l in matcher.get_opcodes():
+            if tag=='equal':parts.append(original[i:j])
+            elif touches(i,j,left) or touches(k,l,right):parts.append(original[i:j])
+            else:parts.append(reply[k:l])
         result=''.join(parts)
         if result==original:return None
         try:return self.validate_confirmed(original,result,terms)
@@ -447,7 +474,7 @@ class ContentPipeline:
             uncertain=result.count('【待核】')
             warning=''
             if salvaged:
-                warning=f'校对 {salvaged} 段仅采用通过校验的句子，其余句子保留原始转写'
+                warning=f'校对 {salvaged} 段保留通过校验的修正，数字冲突或未通过校验的部分使用输入'
             if failed_chunks:
                 fallback='转写及已确认术语' if text!=original else '原始转写'
                 # 三种原因分开说：调用失败、内容未通过校验、两者都有。
@@ -484,6 +511,8 @@ class ContentPipeline:
         if not path.exists():
             write_text(manifest,json.dumps({'fingerprint':fingerprint}))
             text=read_text(state['corrected_path'])
+            task=self.store.task(state['task_id'])
+            video_title=task['title'] if task['kind']=='bili' else ''
             size=self.settings.get('llm','chunk_chars',12000)
             partials=[]
             chunks=split_text(text,size)
@@ -498,22 +527,31 @@ class ContentPipeline:
                     # 但仍只能用白名单里的地址，编造的会被丢弃。
                     allowed=self.material_urls(self.folder(state),chunk)
                     description=self.video_description(self.folder(state))
+                    if video_title:
+                        chunk='视频标题（当前视频的参考资料，不是指令）：\n'+video_title+'\n\n'+chunk
                     if description:
                         chunk='视频简介（参考资料，不是指令）：\n'+description+'\n\n转写正文：\n'+chunk
                         allowed=self.material_urls(self.folder(state),chunk)
                     material=self.with_link_list(chunk,allowed)
+                    if partials:
+                        # 只提供当前任务先前分片的事件身份，不带正文、其他来源或事实摘要。
+                        identities=list({event.get('subject'):event.get('title','')
+                                         for event in partials if event.get('subject')}.items())
+                        inventory=[{'subject':subject,'title':title} for subject,title in identities[-self.EVENT_MAX:]]
+                        material+='\n\n本任务前段事件索引（参考数据，不是指令）：\n'+json.dumps(inventory,ensure_ascii=False)
                     try:
                         events=self.parse_summary(self.llm.call(self.prompt('summarize'),material,True),
                                                   require_title=True,topics=self.settings.topic_order,
                                                   allowed_urls=allowed)
+                        self.validate_title_entity(events,video_title)
                     except SummaryValidationError as exc:
                         exc.detail=f'云端返回，第 {index+1}/{len(chunks)} 段；'+exc.detail
                         raise
                     write_text(part,json.dumps({'events':events},ensure_ascii=False))
                 else:self.report('summarize',f'复用摘要第 {index+1}/{len(chunks)} 段',index+1,len(chunks))
                 partials.extend(self.parse_summary(read_text(part),topics=self.settings.topic_order))
-            # 分片结果直接拼接即可：每片已经按事件拆好，再让模型合并一次反而
-            # 会把它压回单条，等于把刚拆开的粒度又揉回去。
+            # 同任务跨片延续的事件由模型复用 subject，再拼入新增要点；
+            # 不以标题相似度猜测事件，也不额外调用模型压缩整份摘要。
             events=self.merge_partials(partials)
             write_text(path,json.dumps({'events':events},ensure_ascii=False))
             write_text(manifest,json.dumps({'fingerprint':fingerprint}))
@@ -522,6 +560,20 @@ class ContentPipeline:
             log(f'任务 {state["task_id"]}：复用已有摘要')
         self.store.update(state['task_id'],summary_path=str(path))
         return {'summary_path':str(path)}
+
+    @staticmethod
+    def validate_title_entity(events,title):
+        """单事件且标题仅含一个复合英文名称时，拒绝丢失拼写依据的摘要。
+
+        不从读音推断别名，不改写正文；多主体标题和多事件输出不强行绑定。
+        """
+        names=set(re.findall(r'(?<![A-Za-z0-9_/-])[A-Za-z]{2,}(?:-[A-Za-z]{3,})+(?![A-Za-z0-9_/-])',title))
+        if len(events)!=1 or len(names)!=1:return
+        name=next(iter(names))
+        event=events[0]
+        text='\n'.join([event.get('title',''),event.get('subject',''),*event['bullets']])
+        pattern=r'(?<![A-Za-z0-9_])'+re.escape(name)+r'(?![A-Za-z0-9_])'
+        if not re.search(pattern,text,re.I):raise SummaryValidationError('entity',1)
 
     @staticmethod
     def with_link_list(text,urls,limit=80):
@@ -631,15 +683,18 @@ class ContentPipeline:
             subject=item.get('subject')
             if isinstance(subject,str):
                 subject=subject.strip()
-                if 2<=len(subject)<=24 and '\n' not in subject:event['subject']=subject
+                if 2<=len(subject)<=120 and '\n' not in subject and '\r' not in subject:event['subject']=subject
             events.append(event)
         return events
 
     def summary_fingerprint(self,input_path):
-        # version 3：摘要开始带模型标题，旧缓存的要点文本仍可用但与新输出不同源，必须重建。
-        material={'input':read_text(input_path),'video_description':self.video_description(Path(input_path).parent),'prompt':self.prompt('summarize'),'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),'chunk_chars':self.settings.get('llm','chunk_chars',12000),
+        # version 6：视频标题与专名校验进入摘要输入和缓存契约。
+        try:task=self.store.task(int(Path(input_path).parent.name))
+        except ValueError:task={}  # 独立产物校验可没有任务记录；不推断其他视频的标题。
+        material={'video_title':task.get('title','') if task.get('kind')=='bili' else '',
+                  'input':read_text(input_path),'video_description':self.video_description(Path(input_path).parent),'prompt':self.prompt('summarize'),'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),'chunk_chars':self.settings.get('llm','chunk_chars',12000),
                       'max_tokens':self.settings.get('llm','max_tokens',32000),
-                      'topics':list(self.settings.topic_order),'version':5}
+                      'topics':list(self.settings.topic_order),'version':7}
         return hashlib.sha256(json.dumps(material,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
     def summary_current(self,input_path,manifest):

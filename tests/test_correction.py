@@ -146,7 +146,7 @@ class CorrectionTests(unittest.TestCase):
         self.pipeline.llm.call=Mock(return_value='GitHub 提供代码托管。模型版本为 2.2。')
         result=self.correct()
         self.assertEqual(read_text(result['corrected_path']),'GitHub 提供代码托管。模型版本为 2.1。')
-        self.assertIn('其余句子保留原始转写',self.service.store.task(self.task['id'])['warning'])
+        self.assertIn('数字冲突或未通过校验的部分使用输入',self.service.store.task(self.task['id'])['warning'])
         self.assertEqual(read_text(self.raw),original)
 
     def test_cloud_failure_reports_safe_reason(self):
@@ -306,3 +306,34 @@ class CorrectionTests(unittest.TestCase):
         self.correct()
         self.pipeline.llm.call.assert_called_once()
         self.assertTrue(self.manifest()['complete'])
+
+
+class NumericEditRecoveryTests(unittest.TestCase):
+    setUp=CorrectionTests.setUp
+    correct=CorrectionTests.correct
+    def test_name_and_punctuation_survive_number_conflict_in_same_sentence(self):
+        original='four major 是音乐播放器支持 20 个列表'
+        write_text(self.raw,original)
+        self.pipeline.llm.call=Mock(return_value='Folia-major 是音乐播放器，支持 99 个列表。')
+        result=read_text(self.correct()['corrected_path'])
+        self.assertIn('Folia-major',result)
+        self.assertIn('20',result)
+        self.assertNotIn('99',result)
+        self.assertIn('，',result)
+        self.assertEqual(read_text(self.raw),original)
+        self.assertEqual(self.pipeline.llm.call.call_count,1)
+
+    def test_unit_sign_and_value_restore_while_name_fix_survives(self):
+        for original,reply in [
+            ('Kit Hub 增长 -2%。','GitHub 增长 2%。'),
+            ('Kit Hub 占比 2%。','GitHub 占比 2。'),
+            ('Kit Hub 用户 10万。','GitHub 用户 10亿。'),
+            ('Kit Hub 版本 2.1。','GitHub 版本 2.2。')]:
+            with self.subTest(original=original):
+                result=self.pipeline.salvage_correction(original,reply,())
+                self.assertIsNotNone(result)
+                self.assertIn('GitHub',result)
+                self.pipeline.validate_correction(original,result)
+
+    def test_low_similarity_and_missing_text_are_not_salvaged(self):
+        self.assertIsNone(self.pipeline.salvage_correction(self.original,'摘要 99。',()))
