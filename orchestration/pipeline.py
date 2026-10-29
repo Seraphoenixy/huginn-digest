@@ -540,13 +540,20 @@ class ContentPipeline:
                         inventory=[{'subject':subject,'title':title} for subject,title in identities[-self.EVENT_MAX:]]
                         material+='\n\n本任务前段事件索引（参考数据，不是指令）：\n'+json.dumps(inventory,ensure_ascii=False)
                     try:
+                        title_repairs=[]
                         events=self.parse_summary(self.llm.call(self.prompt('summarize'),material,True),
                                                   require_title=True,topics=self.settings.topic_order,
-                                                  allowed_urls=allowed)
+                                                  allowed_urls=allowed,diagnostics=title_repairs)
                         self.validate_title_entity(events,video_title)
                     except SummaryValidationError as exc:
                         exc.detail=f'云端返回，第 {index+1}/{len(chunks)} 段；'+exc.detail
                         raise
+                    if title_repairs:
+                        for event_number,reason in title_repairs:
+                            log(f'任务 {state["task_id"]}：摘要第 {index+1}/{len(chunks)} 段，事件 {event_number}：标题格式修复（{reason}）')
+                        previous=self.store.task(state['task_id']).get('warning','')
+                        warning='摘要标题格式已修复，详细位置见服务日志'
+                        if warning not in previous:self.store.update(state['task_id'],warning='；'.join(filter(None,(previous,warning))))
                     write_text(part,json.dumps({'events':events},ensure_ascii=False))
                 else:self.report('summarize',f'复用摘要第 {index+1}/{len(chunks)} 段',index+1,len(chunks))
                 partials.extend(self.parse_summary(read_text(part),topics=self.settings.topic_order))
@@ -629,7 +636,7 @@ class ContentPipeline:
     BULLETS_MAX=6
 
     @classmethod
-    def parse_summary(cls,text,require_title=False,topics=None,allowed_urls=None):
+    def parse_summary(cls,text,require_title=False,topics=None,allowed_urls=None,diagnostics=None):
         """校验摘要 JSON，返回事件数组。
 
         一条来源可能是单篇文章，也可能是汇总多家新闻的日报。旧结构（单条
@@ -664,14 +671,26 @@ class ContentPipeline:
                 raise SummaryValidationError('bullets',event_index)
             event={'topic':item['topic'],'bullets':bullets}
             title=item.get('title')
-            if isinstance(title,str):
+            if require_title:
+                reason=None
+                if title is None:reason='标题缺失'
+                elif not isinstance(title,str):reason='标题类型无效'
+                elif not title.strip():reason='标题为空'
+                elif len(' '.join(title.split()))>40:reason='标题过长'
+                elif title!=' '.join(title.split()):reason='标题空白已规范化'
+                title=' '.join(title.split()) if isinstance(title,str) else ''
+                if not title:
+                    subject=item.get('subject')
+                    title=' '.join(subject.split()) if isinstance(subject,str) else ''
+                    if not title:title=' '.join(bullets[0].split())
+                if len(title)>40:title=title[:39]+'…'
+                event['title']=title
+                if reason and diagnostics is not None:
+                    diagnostics.append((event_index,reason))
+            elif isinstance(title,str):
                 title=title.strip()
                 if 1<=len(title)<=40 and '\n' not in title and '\r' not in title:
                     event['title']=title
-                elif require_title:
-                    raise SummaryValidationError('title',event_index)
-            elif require_title:
-                raise SummaryValidationError('title',event_index)
             url=item.get('url')
             if isinstance(url,str):
                 url=url.strip()
@@ -694,7 +713,7 @@ class ContentPipeline:
         material={'video_title':task.get('title','') if task.get('kind')=='bili' else '',
                   'input':read_text(input_path),'video_description':self.video_description(Path(input_path).parent),'prompt':self.prompt('summarize'),'model':self.settings.get('llm','model'),'endpoint':self.settings.get('llm','base_url'),'chunk_chars':self.settings.get('llm','chunk_chars',12000),
                       'max_tokens':self.settings.get('llm','max_tokens',32000),
-                      'topics':list(self.settings.topic_order),'version':7}
+                      'topics':list(self.settings.topic_order),'version':8}
         return hashlib.sha256(json.dumps(material,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
     def summary_current(self,input_path,manifest):

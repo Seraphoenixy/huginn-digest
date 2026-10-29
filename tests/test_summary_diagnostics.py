@@ -8,8 +8,7 @@ class SummaryDiagnosticsTests(unittest.TestCase):
         secret='private-token-do-not-log'
         cases=[(secret,'json'),(json.dumps({'events':[]}),'count'),
                (json.dumps({'topic':secret}),'topic'),
-               (json.dumps({'topic':'研究','bullets':[secret*30]}),'bullets'),
-               (json.dumps({'topic':'研究','bullets':['ok'],'title':secret*3}),'title')]
+               (json.dumps({'topic':'研究','bullets':[secret*30]}),'bullets')]
         for payload,code in cases:
             with self.subTest(code=code):
                 with self.assertRaises(SummaryValidationError) as caught:

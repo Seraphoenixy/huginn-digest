@@ -20,16 +20,27 @@ class SummaryTitleParseTests(unittest.TestCase):
         self.assertEqual(len(parsed),1,'旧单条结构应包成单元素数组')
         self.assertEqual(parsed[0]['title'],'新模型发布')
 
-    def test_fresh_model_output_requires_a_title(self):
-        with self.assertRaises(ValueError):
-            ContentPipeline.parse_summary(json.dumps({'topic':'AI 与大模型','bullets':['要点']}),require_title=True)
-
-    def test_title_rejects_blank_multiline_and_overlong(self):
-        for title in ('   ','两行\n标题','长'*41):
+    def test_missing_or_invalid_title_falls_back_without_dropping_event(self):
+        for title in (None,{},'   '):
             with self.subTest(title=title):
-                with self.assertRaises(ValueError):
-                    ContentPipeline.parse_summary(json.dumps({'topic':'AI 与大模型','title':title,'bullets':['要点']}),
-                                                  require_title=True)
+                diagnostics=[]
+                event={'topic':'研究','bullets':['第一条事实。'],'title':title}
+                parsed=ContentPipeline.parse_summary(json.dumps(event),require_title=True,diagnostics=diagnostics)
+                self.assertEqual(parsed[0]['title'],'第一条事实。')
+                self.assertEqual(len(diagnostics),1)
+
+    def test_title_normalizes_newlines_and_marks_truncation(self):
+        for title,expected in [('两行\n标题','两行 标题'),('长'*41,'长'*39+'…')]:
+            with self.subTest(title=title):
+                event={'topic':'研究','title':title,'bullets':['事实']}
+                parsed=ContentPipeline.parse_summary(json.dumps(event),require_title=True)
+                self.assertEqual(parsed[0]['title'],expected)
+
+    def test_fallback_prefers_event_identity_and_keeps_bullets(self):
+        event={'topic':'研究','subject':'事件名称','bullets':['事实保持原样']}
+        parsed=ContentPipeline.parse_summary(json.dumps(event),require_title=True)
+        self.assertEqual(parsed[0]['title'],'事件名称')
+        self.assertEqual(parsed[0]['bullets'],event['bullets'])
 
     def test_legacy_summary_without_title_still_validates(self):
         """复核磁盘产物用的是宽松校验，否则历史摘要会被判损坏并触发重算。"""
