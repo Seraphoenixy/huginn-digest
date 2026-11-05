@@ -34,6 +34,20 @@ class SameEventTests(unittest.TestCase):
         write_text(folder/'summary.json',json.dumps({'events':events},ensure_ascii=False))
         self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
 
+    def add_for_source(self,source_id,title,events,url):
+        """在指定订阅来源下追加一个任务：模拟同一来源先后发布的两支视频。"""
+        self.service.enqueue('bili',{'url':url,'title':title,'published':time.time()},source_id=source_id)
+        task=self.service.store.query('SELECT * FROM tasks WHERE url=?',(url,))[0]
+        self.service.store.execute('UPDATE tasks SET day=? WHERE id=?',(self.day,task['id']))
+        folder=self.settings.content_dir/str(task['id'])
+        write_text(folder/'summary.json',json.dumps({'events':events},ensure_ascii=False))
+        self.service.store.update(task['id'],status='done',summary_path=str(folder/'summary.json'))
+
+    def shared_source(self,name):
+        self.service.store.execute('INSERT INTO sources(kind,target,name,created) VALUES("bili",?,?,?)',
+                                   (name,name,time.time()))
+        return self.service.store.query('SELECT id FROM sources WHERE name=?',(name,))[0]['id']
+
     def repeats(self):
         self.service.publish(self.day)
         model=self.service.briefing(self.day)
@@ -96,6 +110,64 @@ class SameEventTests(unittest.TestCase):
         self.assertIn('视频版',page)
         self.assertIn('文字版',page)
         self.assertIn('新作公布',page)
+    def test_brief_and_detail_videos_of_same_source_group_by_head(self):
+        """实测：同一来源先发简报再发详情，同一项目的 subject 措辞不同但前导专名相同。
+
+        「HowToLiveBetter 提供开源人生攻略」与「HowToLiveBetter 开源生活建议筛选指南」
+        互不包含，包含匹配认不出来；前导专名配对负责把这样的两支视频归到一组。
+        """
+        source=self.shared_source('Oraink灵砚【Github项目】')
+        self.add_for_source(source,'简报视频',
+                            [{'topic':'其他','title':'HowToLiveBetter 开源人生攻略','bullets':['简报版'],
+                              'subject':'HowToLiveBetter 提供开源人生攻略'}],
+                            'https://www.bilibili.com/video/BV1brief11')
+        self.add_for_source(source,'详情视频',
+                            [{'topic':'其他','title':'HowToLiveBetter 开源生活指南','bullets':['详情版'],
+                              'subject':'HowToLiveBetter 开源生活建议筛选指南'}],
+                            'https://www.bilibili.com/video/BV1detail11')
+        result=self.repeats()
+        self.assertEqual(result.get('HowToLiveBetter 开源人生攻略'),2)
+        self.assertEqual(result.get('HowToLiveBetter 开源生活指南'),2)
+        page=self.client.get(f'/daily/{self.day}').text
+        self.assertEqual(page.count('class="same-event"'),1,'简报与详情收进同一个块')
+
+    def test_standalone_tasks_with_same_head_do_not_group(self):
+        """独立提交没有 source_id：两条各自是一个来源，前导专名相同也不配对。"""
+        self.add('a',[{'topic':'其他','title':'OneLife 开源人生攻略','bullets':['a'],
+                       'subject':'OneLife 提供开源人生攻略'}],'https://example.com/one-a')
+        self.add('b',[{'topic':'其他','title':'OneLife 开源生活指南','bullets':['b'],
+                       'subject':'OneLife 开源生活建议筛选指南'}],'https://example.com/one-b')
+        result=self.repeats()
+        self.assertIsNone(result.get('OneLife 开源人生攻略'))
+        self.assertIsNone(result.get('OneLife 开源生活指南'))
+
+    def test_head_in_three_videos_does_not_group(self):
+        """同一专名当日出现三次：无法确认哪两条是同一事件，全部不配对。"""
+        source=self.shared_source('三视频来源')
+        for suffix,url in (('a','https://www.bilibili.com/video/BV1x11111'),
+                           ('b','https://www.bilibili.com/video/BV1x22222'),
+                           ('c','https://www.bilibili.com/video/BV1x33333')):
+            self.add_for_source(source,f'视频{suffix}',
+                                [{'topic':'AI 与大模型','title':f'AlphaLab 用法{suffix}','bullets':[suffix],
+                                  'subject':f'AlphaLab 提供{suffix}用法'}],url)
+        result=self.repeats()
+        for suffix in ('a','b','c'):
+            self.assertIsNone(result.get(f'AlphaLab 用法{suffix}'))
+
+    def test_short_heads_do_not_cause_false_matches(self):
+        """过短专名（fal、kimi 一类）区分度不足，不参与前导专名配对。"""
+        source=self.shared_source('短专名来源')
+        self.add_for_source(source,'视频a',
+                            [{'topic':'行业与公司','title':'Fal 完成融资','bullets':['a'],
+                              'subject':'Fal 完成 16.5 亿美元融资'}],
+                            'https://www.bilibili.com/video/BV1short1')
+        self.add_for_source(source,'视频b',
+                            [{'topic':'行业与公司','title':'Fal 推出新品','bullets':['b'],
+                              'subject':'Fal 发布新服务'}],
+                            'https://www.bilibili.com/video/BV1short2')
+        result=self.repeats()
+        self.assertIsNone(result.get('Fal 完成融资'))
+        self.assertIsNone(result.get('Fal 推出新品'))
 
 
 if __name__=='__main__':unittest.main()

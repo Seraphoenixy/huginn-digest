@@ -423,7 +423,10 @@ class DailyService:
                                 'topic':event.get('topic'),
                                 'bullets':event['bullets'],
                                 'subject':event.get('subject') or '',
-                                'source_name':source_name})
+                                'source_name':source_name,
+                                # 同事件配对要认“真同源”（同一订阅来源的两支视频）；
+                                # 独立提交没有 source_id，不参与同源判定。
+                                'source_id':task['source_id']})
         if broken:
             log(f'日报 {day}：{len(broken)} 条已完成任务的摘要缺失或损坏，沿用其此前条目，待重建补齐')
         # 未成功（失败、重试中或摘要损坏）的任务继续展示上一次成功条目，日报不因处理失败而缩水。
@@ -766,7 +769,37 @@ class DailyService:
         # 条目数很小（一天几十条），直接两两比较比维护并查集更直白。
         keys=[DailyService._subject_key(entry.get('subject')) for entry in entries]
 
-        def same_event(left,right):
+        # 同一来源的简报与详情两支视频，会把同一事件写成互不包含的不同措辞
+        # （「HowToLiveBetter 提供开源人生攻略」与「HowToLiveBetter 开源生活建议
+        # 筛选指南」），包含匹配认不出来。这种 subject 几乎总以同一条前导专名
+        # 开头（仓库名、产品名），专名相等即可配对。配对条件收紧到：
+        # 真同源（source_id 相同且非空）的不同任务，且该专名当日恰好出现两次
+        # ——“OpenAI 聘两人”这类同主体不同事件，要么同属一个任务，要么
+        # 主体出现超过两次，都不会被框成一组。
+        heads=[DailyService._subject_head(key) for key in keys]
+
+        def owner(entry):
+            value=entry.get('task_id',entry.get('id'))
+            if isinstance(value,str) and ':' in value:value=value.split(':',1)[0]
+            try:return int(value)
+            except (TypeError,ValueError):return None
+
+        by_head={}
+        for index,head in enumerate(heads):
+            source_id=entries[index].get('source_id')
+            # 独立提交没有 source_id：两条各自就是一个来源，不做同源配对。
+            if head and source_id is not None:
+                by_head.setdefault((source_id,head),[]).append(index)
+        paired=set()
+        for members in by_head.values():
+            if len(members)!=2:continue
+            left,right=owner(entries[members[0]]),owner(entries[members[1]])
+            if left is not None and right is not None and left!=right:
+                paired.add((members[0],members[1]))
+
+        def same_event(index,other):
+            if (index,other) in paired or (other,index) in paired:return True
+            left,right=keys[index],keys[other]
             if not left or not right:return False
             if left==right:return True
             # 包含匹配只对足够长的键成立：'游戏'、'Kimi' 这种过短主体一旦
@@ -774,10 +807,10 @@ class DailyService:
             if len(left)<SUBJECT_MIN_LENGTH or len(right)<SUBJECT_MIN_LENGTH:return False
             return left in right or right in left
 
-        counts=[0]*len(keys)
-        for i,key in enumerate(keys):
-            for j,other in enumerate(keys):
-                if same_event(key,other):counts[i]+=1
+        counts=[0]*len(entries)
+        for i in range(len(entries)):
+            for j in range(len(entries)):
+                if same_event(i,j):counts[i]+=1
         for entry,repeat in zip(entries,counts):
             # 只在多来源重复时给提示；单条事件不需要“唯一”这种噪音。
             if repeat>1:entry['repeat']=repeat
@@ -788,23 +821,23 @@ class DailyService:
         # 单条事件各自成组，模板用同一套循环渲染，不需要分支。
         clusters=[]
         groups=[]
-        for entry,key,repeat in zip(entries,keys,counts):
-            if repeat<=1 or not key:
+        for index,entry in enumerate(entries):
+            if counts[index]<=1 or not keys[index]:
                 groups.append({'label':'','size':1,'entries':[entry]})
                 continue
             target=None
             for group in clusters:
-                if any(same_event(key,other) for other in group['keys']):
+                if any(same_event(index,other) for other in group['indices']):
                     target=group;break
             if target is None:
-                target={'entries':[],'keys':set()}
+                target={'entries':[],'indices':set()}
                 clusters.append(target)
                 groups.append(target)
             target['entries'].append(entry)
-            target['keys'].add(key)
+            target['indices'].add(index)
         for group in groups:
             group['size']=len(group['entries'])
-            group.pop('keys',None)
+            group.pop('indices',None)
             group['label']=f'同一事件 · {group["size"]} 个来源' if group['size']>1 else ''
         # 每组只挂在本组首条所属的节下，跨节同名不会被拆到两处。
         by_topic={topic:[] for topic in order}
@@ -820,6 +853,19 @@ class DailyService:
         if not isinstance(subject,str):return ''
         value=''.join(subject.split()).lower()
         return value.strip('，,。.、:：?!！?')
+
+    @staticmethod
+    def _subject_head(key):
+        """归一化键的前导专名：仓库名、产品名等拉丁数字串（含连字符与点）。
+
+        简报与详情两支视频对同一项目会写不同的动作描述，但主体专名几乎总是
+        原样出现在 subject 开头；主体之外的措辞不参与判断。过短的串（'fal'、
+        'kimi' 一类）区分度不足，不作为配对依据。
+        """
+        import re
+        if not isinstance(key,str):return ''
+        match=re.match(r'[a-z0-9]+(?:[.\-][a-z0-9]+)*',key)
+        return match.group() if match and len(match.group())>=5 else ''
 
     @staticmethod
     def report_stats(report,dates=None,topics=None):
